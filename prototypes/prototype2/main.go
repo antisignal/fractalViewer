@@ -18,6 +18,13 @@ Things I'm not yet targeting include:
 - multithreading/anything parallel
 */
 
+// these should not be changed from 640, 480 until the next iteration
+const xRes = 640
+const yRes = 480
+const maxIterations = 1024
+
+var mandelbrotRect = sdl.FRect{-2, -1.5, 4, 3}
+
 func main() {
 	var initFlags uint32 = sdl.INIT_EVERYTHING
 	err := sdl.Init(initFlags)
@@ -26,7 +33,7 @@ func main() {
 	}
 	var _ *sdl.Window
 	var renderer *sdl.Renderer
-	_, renderer, err = sdl.CreateWindowAndRenderer(640, 480, sdl.WINDOW_SHOWN)
+	_, renderer, err = sdl.CreateWindowAndRenderer(xRes, yRes, sdl.WINDOW_SHOWN)
 	if err != nil {
 		panic(err)
 	}
@@ -44,12 +51,67 @@ func main() {
 	}
 	err = renderer.SetDrawColor(0, 0, 0, 255)
 
-	var mandelbrotRect = sdl.FRect{-2, -1.5, 4, 3}
+	// for the sake of making this a function: this entire section requires the mandelbrotRect and global variables as context...
+	// actually, we can just make the mandelbrotRect a const and pass a scaled version of it
 
 	// O(m*n) with kind of a high coefficient
-	for i := 0; i < 640; i++ { // we'll iterate i,j for m,n - the actual coordinates
-		for j := 0; j < 480; j++ {
-			var value = calculateMandelbrotValue(renderSurfaceToMandelbrotCoord([2]int{i, j}, mandelbrotRect, sdl.Rect{0, 0, 640, 480}), 1024)
+	updateMandelbrotDisplay(mandelbrotRect, renderer)
+
+	for {
+		for e := sdl.PollEvent(); e != nil; e = sdl.PollEvent() {
+			switch t := e.(type) {
+			case *sdl.QuitEvent:
+				sdl.Quit()
+				break
+			case *sdl.KeyboardEvent:
+				if t.Keysym.Sym == sdl.K_ESCAPE {
+					sdl.Quit()
+					break
+				}
+				if t.Keysym.Sym == sdl.K_r {
+					// resetZoomStack may not need to take any arguments - maybe we can make a newZoomStack instead
+					masterZoomStack = resetZoomStack(masterZoomStack)
+					updateMandelbrotDisplay(mandelbrotRect, renderer)
+				}
+			case *sdl.MouseButtonEvent:
+				if t.Button == sdl.BUTTON_LEFT {
+					if t.State == sdl.PRESSED {
+						var mouseX, mouseY, _ = sdl.GetMouseState()
+						scale, center := masterZoomStack.peek()
+						var currentMandelbrotSubsetRect = genNextMandelbrotSubsetRectFromContext(mandelbrotRect, scale, center[0], center[1])
+						var plotX, plotY = getPlotCoordsFromWindowCoordsAndContext(int(mouseX), int(mouseY), xRes, yRes, scale, center, currentMandelbrotSubsetRect)
+						masterZoomStack = masterZoomStack.push(float64(plotX), float64(plotY))
+						var newScale = scale / 2
+						var newMandelbrotSubsetRect = genNextMandelbrotSubsetRectFromContext(mandelbrotRect, newScale, plotX, plotY)
+						updateMandelbrotDisplay(newMandelbrotSubsetRect, renderer)
+					}
+				}
+			}
+		}
+	}
+}
+
+func genNextMandelbrotSubsetRectFromContext(mandelbrotSubsetRect sdl.FRect, scale float64, plotX float64, plotY float64) sdl.FRect {
+	var scaledSubsetRect sdl.FRect = sdl.FRect{mandelbrotSubsetRect.X * float32(scale), mandelbrotSubsetRect.Y * float32(scale), mandelbrotSubsetRect.W * float32(scale), mandelbrotSubsetRect.H * float32(scale)}
+	var transposedSubsetRect sdl.FRect = sdl.FRect{
+		X: float32(plotX) + scaledSubsetRect.X,
+		Y: float32(plotY) + scaledSubsetRect.Y,
+		W: scaledSubsetRect.W,
+		H: scaledSubsetRect.H,
+	}
+	return transposedSubsetRect
+	// var x1 = float32(plotX - (scale * float64(mandelbrotSubsetRect.W)))
+	// var y1 = float32(plotY + (scale * float64(mandelbrotSubsetRect.H)))
+	// // var x2 = plotX + (scale * ((xRes / 2) - 1))
+	// // var y2 = plotY - (scale * ((yRes / 2) - 1))
+	// return sdl.FRect{x1, y1, float32(float32(scale) * (mandelbrotSubsetRect.W / float32(xRes)) * float32(xRes)), float32(float32(scale) * (mandelbrotSubsetRect.H / float32(yRes)) * float32(yRes))} // check for off by 1 later
+}
+
+// unless this returns the array with the raw values, the values themselves are inaccessible from outside this function
+func updateMandelbrotDisplay(mandelbrotSubsetRect sdl.FRect, renderer *sdl.Renderer) {
+	for i := 0; i < xRes; i++ { // we'll iterate i,j for m,n - the actual coordinates
+		for j := 0; j < yRes; j++ {
+			var value = calculateMandelbrotValue(renderSurfaceToMandelbrotCoord([2]int{i, j}, mandelbrotSubsetRect, sdl.Rect{0, 0, xRes, yRes}), maxIterations)
 
 			//var selectedColor = calculateColorFromValueViaCCG(value, 1024)
 			populateColorFromValueBW(value, 1024)
@@ -67,28 +129,6 @@ func main() {
 		}
 	}
 	renderer.Present()
-
-	for {
-		for e := sdl.PollEvent(); e != nil; e = sdl.PollEvent() {
-			switch t := e.(type) {
-			case *sdl.QuitEvent:
-				sdl.Quit()
-				break
-			case *sdl.KeyboardEvent:
-				if t.Keysym.Sym == sdl.K_ESCAPE {
-					sdl.Quit()
-					break
-				}
-			case *sdl.MouseButtonEvent:
-				if t.Button == sdl.BUTTON_LEFT {
-					if t.State == sdl.PRESSED {
-						var x, y, _ = sdl.GetMouseState()
-						masterZoomStack.push(float64(x), float64(y))
-					}
-				}
-			}
-		}
-	}
 }
 
 func mandelbrotToRenderSurfaceCoord(inCoord complex128, mandelbrotRect sdl.FRect, renderSurfaceRect sdl.Rect) [2]int {
@@ -158,6 +198,7 @@ func individualCalculationsTest() {
 	fmt.Println(renderSurfaceToMandelbrotCoord(mandelbrotToRenderSurfaceCoord(complex(-2, -1)))) */
 }
 
+// passing maxIterations is probably redundant for now given that it's a global variable
 func calculateMandelbrotValue(c complex128, maxIterations int) int {
 	var z complex128 = complex(0, 0)
 	for i := 0; i < maxIterations; i++ {
@@ -183,22 +224,24 @@ type zoomStack struct {
 
 // one notable feature of this stack is that each next scale is half the previous, hence we don't add it as a parameter
 // this requires the zoomStack to probably be seeded with a base coord and scale (1/160) (???)
-func (z zoomStack) push(x float64, y float64) {
+// x and y are NOT the screen coords. there's some abuse of naming here. they're the coords on the plot
+func (z zoomStack) push(x float64, y float64) zoomStack {
 	var newTopNode = &zoomStackNode{
 		scale:  z.top.scale / 2,
 		center: [2]float64{x, y},
 		next:   z.top, // this should be fine in every case
 	}
 	z.top = newTopNode
+	return z
 }
 
-func (z zoomStack) pop() (scale float64, center [2]float64, ok bool) {
+func (z zoomStack) pop() (scale float64, center [2]float64, updatedZoomStack zoomStack, ok bool) {
 	var retNode = z.top
 	if retNode != nil && retNode.next != nil {
 		z.top = retNode.next
-		return retNode.scale, retNode.center, true
+		return retNode.scale, retNode.center, z, true
 	} else {
-		return 0.0, [2]float64{0.0, 0.0}, false
+		return 0.0, [2]float64{0.0, 0.0}, z, false
 	}
 }
 
@@ -207,11 +250,33 @@ func (z zoomStack) peek() (scale float64, center [2]float64) {
 }
 
 // should always be seeded
+
+func resetZoomStack(z zoomStack) zoomStack {
+	z.top = &zoomStackNode{
+		// why would scale have been 1/160? what was my reasoning?
+		scale:  1,
+		center: [2]float64{0.0, 0.0},
+	}
+	return z
+}
+
 var masterZoomStack = zoomStack{
 	top: &zoomStackNode{
-		scale:  1 / 160,
+		// why would scale have been 1/160? what was my reasoning?
+		scale:  1,
 		center: [2]float64{0.0, 0.0},
 	},
+}
+
+// this function will be used a lot I anticipate. naming things is the hardest thing in programming
+// xRes, yRes assumed to fit some constraints I haven't formalized
+func getPlotCoordsFromWindowCoordsAndContext(windowX int, windowY int, xRes int, yRes int, scale float64, center [2]float64, mandelbrotSubsetRect sdl.FRect) (float64, float64) {
+	//var plotX = center[0] - ((float64(xRes-windowX) / 2.0) * scale)
+	//var plotY = center[1] - ((float64(yRes-windowY) / 2.0) * scale)
+	var plotX = center[0] - float64((xRes/2.0)-windowX)*scale*(float64(mandelbrotSubsetRect.W/float32(xRes)))
+	// 6/19 i changed this as a test - it was negative before. it might not work
+	var plotY = center[1] - float64((yRes/2.0)-windowY)*scale*(float64(mandelbrotSubsetRect.H/float32(yRes)))
+	return plotX, plotY
 }
 
 // colors
