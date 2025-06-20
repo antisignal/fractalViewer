@@ -79,7 +79,7 @@ func main() {
 						var mouseX, mouseY, _ = sdl.GetMouseState()
 						scale, center := masterZoomStack.peek()
 						var currentMandelbrotSubsetRect = genNextMandelbrotSubsetRectFromContext(mandelbrotRect, scale, center[0], center[1])
-						var plotX, plotY = getPlotCoordsFromWindowCoordsAndContext(int(mouseX), int(mouseY), xRes, yRes, scale, center, currentMandelbrotSubsetRect)
+						var plotX, plotY = getPlotCoordsFromWindowCoordsAndContext(int(mouseX), int(mouseY), xRes, yRes, currentMandelbrotSubsetRect)
 						masterZoomStack = masterZoomStack.push(float64(plotX), float64(plotY))
 						var newScale = scale / 2
 						var newMandelbrotSubsetRect = genNextMandelbrotSubsetRectFromContext(mandelbrotRect, newScale, plotX, plotY)
@@ -94,8 +94,8 @@ func main() {
 func genNextMandelbrotSubsetRectFromContext(mandelbrotSubsetRect sdl.FRect, scale float64, plotX float64, plotY float64) sdl.FRect {
 	var scaledSubsetRect sdl.FRect = sdl.FRect{mandelbrotSubsetRect.X * float32(scale), mandelbrotSubsetRect.Y * float32(scale), mandelbrotSubsetRect.W * float32(scale), mandelbrotSubsetRect.H * float32(scale)}
 	var transposedSubsetRect sdl.FRect = sdl.FRect{
-		X: float32(plotX) + scaledSubsetRect.X,
-		Y: float32(plotY) + scaledSubsetRect.Y,
+		X: float32(plotX) - (scaledSubsetRect.W / 2),
+		Y: float32(plotY) - (scaledSubsetRect.H / 2),
 		W: scaledSubsetRect.W,
 		H: scaledSubsetRect.H,
 	}
@@ -270,12 +270,16 @@ var masterZoomStack = zoomStack{
 
 // this function will be used a lot I anticipate. naming things is the hardest thing in programming
 // xRes, yRes assumed to fit some constraints I haven't formalized
-func getPlotCoordsFromWindowCoordsAndContext(windowX int, windowY int, xRes int, yRes int, scale float64, center [2]float64, mandelbrotSubsetRect sdl.FRect) (float64, float64) {
-	//var plotX = center[0] - ((float64(xRes-windowX) / 2.0) * scale)
-	//var plotY = center[1] - ((float64(yRes-windowY) / 2.0) * scale)
-	var plotX = center[0] - float64((xRes/2.0)-windowX)*scale*(float64(mandelbrotSubsetRect.W/float32(xRes)))
-	// 6/19 i changed this as a test - it was negative before. it might not work
-	var plotY = center[1] - float64((yRes/2.0)-windowY)*scale*(float64(mandelbrotSubsetRect.H/float32(yRes)))
+func getPlotCoordsFromWindowCoordsAndContext(windowX int, windowY int, xRes int, yRes int, mandelbrotSubsetRect sdl.FRect) (float64, float64) {
+	// //var plotX = center[0] - ((float64(xRes-windowX) / 2.0) * scale)
+	// // var plotY = center[1] - ((float64(yRes-windowY) / 2.0) * scale)
+	// var plotX = center[0] - float64((xRes/2.0)-windowX)*scale*(float64(mandelbrotSubsetRect.W/float32(xRes)))
+	// // 6/19 i changed this as a test - it was negative before. it might not work
+	// var plotY = center[1] - float64((yRes/2.0)-windowY)*scale*(float64(mandelbrotSubsetRect.H/float32(yRes)))
+	var fractOfMSRX = float64(windowX) / float64(xRes)
+	var fractOfMSRY = float64(windowY) / float64(yRes)
+	var plotX = (fractOfMSRX * float64(mandelbrotSubsetRect.W)) + float64(mandelbrotSubsetRect.X)
+	var plotY = (fractOfMSRY * float64(mandelbrotSubsetRect.H)) + float64(mandelbrotSubsetRect.Y)
 	return plotX, plotY
 }
 
