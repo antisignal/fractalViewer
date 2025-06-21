@@ -8,14 +8,20 @@ import (
 
 /*
 This second prototype will improve on the first in the following ways:
-- inclusion of a way to select the bounds to display (given a center coordinate and a y half-length
-- color
-- zoom stack (left click zooms in by 2x, right click goes up a level)
+- inclusion of a way to select the bounds to display (given a center coordinate and a y half-length) (done)
+- color (supports gradient now, with like 8 color buckets)
+- zoom stack (left click zooms in by 2x, right click goes up a level) (left click works)
 - coordinate display (bounds, hover pos)
 
 Things I'm not yet targeting include:
 - support for multiple resolutions
+- custom color palette/importing gradient from file (probably easy)
 - multithreading/anything parallel
+- going to an exact coordinate
+- smooth zoom (rescale/translate the texture until we let go of the scroll wheel/
+	mouse drag & drop
+- more robust controls (scroll to zoom, drag & drop translation?
+- multiple windows, one for controls? (good for prototyping)
 */
 
 // these should not be changed from 640, 480 until the next iteration
@@ -24,6 +30,16 @@ const yRes = 480
 const maxIterations = 1024
 
 var mandelbrotRect = sdl.FRect{-2, -1.5, 4, 3}
+
+var hudPaddingAbove = 5 // pixels
+var hudPaddingRight = 5 // pixels as well
+
+var hudText = ""
+
+// a context might be helpful
+func genHUDText(scale float64, bounds sdl.FRect, hoverCoord [2]float64) {
+
+}
 
 func main() {
 	var initFlags uint32 = sdl.INIT_EVERYTHING
@@ -86,6 +102,15 @@ func main() {
 						updateMandelbrotDisplay(newMandelbrotSubsetRect, renderer)
 					}
 				}
+				if t.Button == sdl.BUTTON_RIGHT {
+					if t.State == sdl.PRESSED {
+						// i think it's the same outcome regardless of whether the pop is okay or not
+						_, _, masterZoomStack, _ = masterZoomStack.pop() // discard top value entirely
+						scale, center := masterZoomStack.peek()
+						var lastMandelbrotSubsetRect = genNextMandelbrotSubsetRectFromContext(mandelbrotRect, scale, center[0], center[1])
+						updateMandelbrotDisplay(lastMandelbrotSubsetRect, renderer)
+					}
+				}
 			}
 		}
 	}
@@ -109,12 +134,13 @@ func genNextMandelbrotSubsetRectFromContext(mandelbrotSubsetRect sdl.FRect, scal
 
 // unless this returns the array with the raw values, the values themselves are inaccessible from outside this function
 func updateMandelbrotDisplay(mandelbrotSubsetRect sdl.FRect, renderer *sdl.Renderer) {
+	// for the future, mandelbrotSubsetRect not necessary if calculating all values in advance
+	// just iterate as usual over the premade array - getting the colors might even be parallelizable
 	for i := 0; i < xRes; i++ { // we'll iterate i,j for m,n - the actual coordinates
 		for j := 0; j < yRes; j++ {
 			var value = calculateMandelbrotValue(renderSurfaceToMandelbrotCoord([2]int{i, j}, mandelbrotSubsetRect, sdl.Rect{0, 0, xRes, yRes}), maxIterations)
-
 			//var selectedColor = calculateColorFromValueViaCCG(value, 1024)
-			populateColorFromValueBW(value, 1024)
+			populateColorFromValueBW(value, maxIterations)
 			// for lack of a better name
 			var selectedColorStore, _ = colorMemo[value]
 			var selectedColor = &selectedColorStore
@@ -237,8 +263,11 @@ func (z zoomStack) push(x float64, y float64) zoomStack {
 
 func (z zoomStack) pop() (scale float64, center [2]float64, updatedZoomStack zoomStack, ok bool) {
 	var retNode = z.top
-	if retNode != nil && retNode.next != nil {
-		z.top = retNode.next
+	// this used to say && if retNode.next != nil - this is probably not correct
+	if retNode != nil {
+		if retNode.next != nil {
+			z.top = retNode.next
+		}
 		return retNode.scale, retNode.center, z, true
 	} else {
 		return 0.0, [2]float64{0.0, 0.0}, z, false
