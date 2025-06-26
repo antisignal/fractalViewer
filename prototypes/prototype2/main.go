@@ -155,6 +155,7 @@ func main() {
 	// initialize the texture cache (did we do this? i can't remember if this comment is here for a reason or not)
 	// init hudRect to something that makes sense
 	hudRect = mandelbrotRect
+	cachedMandelbrotTexture, err = renderer.CreateTexture(sdl.PIXELFORMAT_RGBA8888, sdl.TEXTUREACCESS_TARGET, int32(xRes), int32(yRes))
 	// O(m*n) with kind of a high coefficient
 	updateMandelbrotDisplay(mandelbrotRect, renderer, window)
 	var hoverCoordX, hoverCoordY, _ = sdl.GetMouseState()
@@ -282,6 +283,21 @@ func genNextMandelbrotSubsetRectFromContext(mandelbrotSubsetRect sdl.FRect, scal
 func updateMandelbrotDisplay(mandelbrotSubsetRect sdl.FRect, renderer *sdl.Renderer, window *sdl.Window) {
 	// for the future, mandelbrotSubsetRect not necessary if calculating all values in advance
 	// just iterate as usual over the premade array - getting the colors might even be parallelizable
+	var oldRenderTarget = renderer.GetRenderTarget()
+	defer func() {
+		err := renderer.SetRenderTarget(oldRenderTarget)
+		if err != nil {
+			panic(err)
+		}
+	}()
+	// assert
+	if cachedMandelbrotTexture == nil {
+		panic("failed assert: cachedMandelbrotTexture was not initialized before use")
+	}
+	err := renderer.SetRenderTarget(cachedMandelbrotTexture)
+	if err != nil {
+		panic(err)
+	}
 	for i := 0; i < xRes; i++ { // we'll iterate i,j for m,n - the actual coordinates
 		for j := 0; j < yRes; j++ {
 			var value = calculateMandelbrotValue(renderSurfaceToMandelbrotCoord([2]int{i, j}, mandelbrotSubsetRect, sdl.Rect{0, 0, xRes, yRes}), maxIterations)
@@ -301,11 +317,7 @@ func updateMandelbrotDisplay(mandelbrotSubsetRect sdl.FRect, renderer *sdl.Rende
 		}
 	}
 	// renderer.GetRenderTarget() returns nil if it's on the default render target
-	err := window.UpdateSurface()
-	if err != nil {
-		panic(err)
-	}
-	cachedMandelbrotSurface, err := window.GetSurface()
+	/* cachedMandelbrotSurface, err := window.GetSurface()
 	if err != nil {
 		panic(err)
 	}
@@ -317,6 +329,7 @@ func updateMandelbrotDisplay(mandelbrotSubsetRect sdl.FRect, renderer *sdl.Rende
 	if err != nil {
 		panic(err)
 	}
+	*/
 }
 
 func mandelbrotToRenderSurfaceCoord(inCoord complex128, mandelbrotRect sdl.FRect, renderSurfaceRect sdl.Rect) [2]int {
