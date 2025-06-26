@@ -3,7 +3,9 @@ package main
 import (
 	"fmt"
 	"github.com/veandco/go-sdl2/sdl"
+	"github.com/veandco/go-sdl2/ttf"
 	"math"
+	"strconv"
 )
 
 /*
@@ -11,7 +13,7 @@ This second prototype will improve on the first in the following ways:
 - inclusion of a way to select the bounds to display (given a center coordinate and a y half-length) (done)
 - color (supports gradient now, with like 8 color buckets)
 - zoom stack (left click zooms in by 2x, right click goes up a level) (left click works)
-- coordinate display (bounds, hover pos)
+- coordinate display (bounds, hover pos) (messy but works in principle)
 
 Things I'm not yet targeting include:
 - support for multiple resolutions
@@ -35,10 +37,79 @@ var hudPaddingAbove = 5 // pixels
 var hudPaddingRight = 5 // pixels as well
 
 var hudText = ""
+var hudScale = 1.0
+var hudRect = sdl.FRect{}
+var hudHoverCoord = [2]float64{}
 
 // a context might be helpful
-func genHUDText(scale float64, bounds sdl.FRect, hoverCoord [2]float64) {
+func genHUDText(scale float64, bounds sdl.FRect, hoverCoord [2]float64) string {
+	// this might be breaking a rule about functions doing only one thing. these conversions are also kind of silly
+	var targetCoord = renderSurfaceToMandelbrotCoord([2]int{int(hoverCoord[0]), int(hoverCoord[1])}, bounds, sdl.Rect{W: xRes, H: yRes})
+	// stupid simple way
+	var scaleLabel = "scale: "
+	var scaleValue = strconv.FormatFloat(scale, 'g', -1, 64)
+	var boundsLabel = "bounds: "
+	// bruh. this line could be considerably shorter if i gen'd each string separately, but it's not worth it right now
+	var boundsValue = "(" + strconv.FormatFloat(
+		float64(bounds.X), 'g', -1, 64) + ", " + strconv.FormatFloat(
+		float64(bounds.Y), 'g', -1, 64) + "), (" + strconv.FormatFloat(
+		float64(bounds.X+bounds.W), 'g', -1, 64) + ", " + strconv.FormatFloat(
+		float64(bounds.Y+bounds.H), 'g', -1, 64) + ") "
+	var hoverCoordLabel = "hover pos: "
+	var hoverCoordValue = "(" + strconv.FormatFloat(
+		hoverCoord[0], 'g', -1, 64) + ", " + strconv.FormatFloat(
+		hoverCoord[1], 'g', -1, 64) + ") "
+	var targetCoordLabel = "target pos: "
+	var targetCoordValue = "(" + strconv.FormatFloat(
+		real(targetCoord), 'g', -1, 64) + ", " + strconv.FormatFloat(
+		imag(targetCoord), 'g', -1, 64) + ")"
+	return scaleLabel + scaleValue + boundsLabel + boundsValue + hoverCoordLabel + hoverCoordValue + targetCoordLabel + targetCoordValue
+}
 
+func renderHUDText(hudText string, renderer *sdl.Renderer, font *ttf.Font) *sdl.Texture {
+	var textSurface, err = font.RenderUTF8Solid(hudText, sdl.Color{255, 255, 255, 255})
+	if err != nil {
+		panic(err)
+	}
+	baseTexture, err := renderer.CreateTexture(sdl.PIXELFORMAT_RGBA8888, sdl.TEXTUREACCESS_TARGET, textSurface.W, textSurface.H)
+	var previousRenderTarget = renderer.GetRenderTarget()
+	err = renderer.SetRenderTarget(baseTexture)
+	if err != nil {
+		panic(err)
+	}
+	// draw step
+	_, _, baseTextureW, baseTextureH, err := baseTexture.Query()
+	if textSurface.W != baseTextureW || textSurface.H != baseTextureH {
+		panic("hit a failed assert: text and base surfaces do not share H or W")
+	}
+	textTexture, err := renderer.CreateTextureFromSurface(textSurface)
+	err = renderer.Copy(textTexture, &sdl.Rect{0, 0, textSurface.W, textSurface.H}, &sdl.Rect{0, 0, textSurface.W, textSurface.H})
+	if err != nil {
+		panic(err)
+	}
+	err = renderer.SetRenderTarget(previousRenderTarget)
+	if err != nil {
+		panic(err)
+	}
+	// is returning a sdl.Texture with no reference safe? i'm guessing no
+	return baseTexture
+}
+
+var cachedMandelbrotTexture *sdl.Texture
+
+var defaultFont *ttf.Font = nil
+
+func drawHUDTexture(renderer *sdl.Renderer, hudTexture *sdl.Texture) {
+	_, _, w, h, err := hudTexture.Query()
+	if err != nil {
+		panic(err)
+	}
+	var x = (xRes - 1) - (w + int32(hudPaddingRight))
+	var y = int32(hudPaddingAbove)
+	err = renderer.Copy(hudTexture, &sdl.Rect{W: w, H: h}, &sdl.Rect{X: x, Y: y, W: w, H: h})
+	if err != nil {
+		panic(err)
+	}
 }
 
 func main() {
@@ -47,9 +118,20 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	var _ *sdl.Window
+
+	// render ttf first
+	err = ttf.Init()
+	if err != nil {
+		panic(err)
+	}
+	defaultFont, err = ttf.OpenFont("./m5x7.ttf", 18)
+	if err != nil {
+		panic(err)
+	}
+
+	var window *sdl.Window
 	var renderer *sdl.Renderer
-	_, renderer, err = sdl.CreateWindowAndRenderer(xRes, yRes, sdl.WINDOW_SHOWN)
+	window, renderer, err = sdl.CreateWindowAndRenderer(xRes, yRes, sdl.WINDOW_SHOWN)
 	if err != nil {
 		panic(err)
 	}
@@ -70,8 +152,18 @@ func main() {
 	// for the sake of making this a function: this entire section requires the mandelbrotRect and global variables as context...
 	// actually, we can just make the mandelbrotRect a const and pass a scaled version of it
 
+	// initialize the texture cache (did we do this? i can't remember if this comment is here for a reason or not)
+	// init hudRect to something that makes sense
+	hudRect = mandelbrotRect
 	// O(m*n) with kind of a high coefficient
-	updateMandelbrotDisplay(mandelbrotRect, renderer)
+	updateMandelbrotDisplay(mandelbrotRect, renderer, window)
+	var hoverCoordX, hoverCoordY, _ = sdl.GetMouseState()
+	hudText = genHUDText(masterZoomStack.top.scale, mandelbrotRect, [2]float64{float64(hoverCoordX), float64(hoverCoordY)})
+	var hudTexture = renderHUDText(hudText, renderer, defaultFont)
+	drawHUDTexture(renderer, hudTexture)
+
+	renderer.Present()
+	// past this point the texture cache should be initialized
 
 	for {
 		for e := sdl.PollEvent(); e != nil; e = sdl.PollEvent() {
@@ -87,8 +179,38 @@ func main() {
 				if t.Keysym.Sym == sdl.K_r {
 					// resetZoomStack may not need to take any arguments - maybe we can make a newZoomStack instead
 					masterZoomStack = resetZoomStack(masterZoomStack)
-					updateMandelbrotDisplay(mandelbrotRect, renderer)
+					updateMandelbrotDisplay(mandelbrotRect, renderer, window)
+					hoverCoordX, hoverCoordY, _ = sdl.GetMouseState()
+					hudText = genHUDText(masterZoomStack.top.scale, mandelbrotRect, [2]float64{float64(hoverCoordX), float64(hoverCoordY)})
+					hudTexture = renderHUDText(hudText, renderer, defaultFont)
+					drawHUDTexture(renderer, hudTexture)
+					renderer.Present()
 				}
+			case *sdl.MouseMotionEvent:
+				// should this get its own function? this also depends on the texture and window both being xRes by yRes
+
+				// So, when this is disabled, we see everything work except the text just goes on top of other text.
+				// When it's enabled, the text doesn't overlap but whenever we try to load from the cache, it's black
+				// => caching not happening properly?
+				err = renderer.Copy(cachedMandelbrotTexture, &sdl.Rect{W: xRes, H: yRes}, &sdl.Rect{W: xRes, H: yRes})
+				renderer.Present()
+				if err != nil {
+					panic(err)
+				}
+
+				// there's a possibility that bugs will be introduced by accidentally not updating the stack -
+				// this code needs better documentation of where certain lines are responsible for things
+				// and where it feels like things are hacky
+				var currentMandelbrotSubsetRect = genNextMandelbrotSubsetRectFromContext(
+					mandelbrotRect, masterZoomStack.top.scale, masterZoomStack.top.center[0], masterZoomStack.top.center[1])
+				var newHudText = genHUDText(masterZoomStack.top.scale, currentMandelbrotSubsetRect, [2]float64{float64(t.X), float64(t.Y)})
+				var newHudTexture = renderHUDText(newHudText, renderer, defaultFont)
+				if err != nil {
+					panic(err)
+				}
+				drawHUDTexture(renderer, newHudTexture)
+				renderer.Present()
+
 			case *sdl.MouseButtonEvent:
 				if t.Button == sdl.BUTTON_LEFT {
 					if t.State == sdl.PRESSED {
@@ -99,7 +221,20 @@ func main() {
 						masterZoomStack = masterZoomStack.push(float64(plotX), float64(plotY))
 						var newScale = scale / 2
 						var newMandelbrotSubsetRect = genNextMandelbrotSubsetRectFromContext(mandelbrotRect, newScale, plotX, plotY)
-						updateMandelbrotDisplay(newMandelbrotSubsetRect, renderer)
+						updateMandelbrotDisplay(newMandelbrotSubsetRect, renderer, window)
+						var currentHoverCoordX, currentHoverCoordY, _ = sdl.GetMouseState()
+						// this is getting messy. something to consider for the 3rd iteration
+						//
+						hudScale = newScale
+						hudRect = newMandelbrotSubsetRect
+						hudHoverCoord = [2]float64{float64(currentHoverCoordX), float64(currentHoverCoordY)}
+						var newHudText = genHUDText(newScale, newMandelbrotSubsetRect, [2]float64{float64(currentHoverCoordX), float64(currentHoverCoordY)})
+						var newHudTexture = renderHUDText(newHudText, renderer, defaultFont)
+						if err != nil {
+							panic(err)
+						}
+						drawHUDTexture(renderer, newHudTexture)
+						renderer.Present()
 					}
 				}
 				if t.Button == sdl.BUTTON_RIGHT {
@@ -108,7 +243,18 @@ func main() {
 						_, _, masterZoomStack, _ = masterZoomStack.pop() // discard top value entirely
 						scale, center := masterZoomStack.peek()
 						var lastMandelbrotSubsetRect = genNextMandelbrotSubsetRectFromContext(mandelbrotRect, scale, center[0], center[1])
-						updateMandelbrotDisplay(lastMandelbrotSubsetRect, renderer)
+						updateMandelbrotDisplay(lastMandelbrotSubsetRect, renderer, window)
+						hudScale = scale
+						hudRect = lastMandelbrotSubsetRect
+						var currentHoverCoordX, currentHoverCoordY, _ = sdl.GetMouseState()
+						hudHoverCoord = [2]float64{float64(currentHoverCoordX), float64(currentHoverCoordY)}
+						var newHudText = genHUDText(scale, lastMandelbrotSubsetRect, [2]float64{hudHoverCoord[0], hudHoverCoord[1]})
+						var newHudTexture = renderHUDText(newHudText, renderer, defaultFont)
+						if err != nil {
+							panic(err)
+						}
+						drawHUDTexture(renderer, newHudTexture)
+						renderer.Present()
 					}
 				}
 			}
@@ -133,7 +279,7 @@ func genNextMandelbrotSubsetRectFromContext(mandelbrotSubsetRect sdl.FRect, scal
 }
 
 // unless this returns the array with the raw values, the values themselves are inaccessible from outside this function
-func updateMandelbrotDisplay(mandelbrotSubsetRect sdl.FRect, renderer *sdl.Renderer) {
+func updateMandelbrotDisplay(mandelbrotSubsetRect sdl.FRect, renderer *sdl.Renderer, window *sdl.Window) {
 	// for the future, mandelbrotSubsetRect not necessary if calculating all values in advance
 	// just iterate as usual over the premade array - getting the colors might even be parallelizable
 	for i := 0; i < xRes; i++ { // we'll iterate i,j for m,n - the actual coordinates
@@ -154,7 +300,23 @@ func updateMandelbrotDisplay(mandelbrotSubsetRect sdl.FRect, renderer *sdl.Rende
 			}
 		}
 	}
-	renderer.Present()
+	// renderer.GetRenderTarget() returns nil if it's on the default render target
+	err := window.UpdateSurface()
+	if err != nil {
+		panic(err)
+	}
+	cachedMandelbrotSurface, err := window.GetSurface()
+	if err != nil {
+		panic(err)
+	}
+	// assert
+	if cachedMandelbrotSurface.W != xRes || cachedMandelbrotSurface.H != yRes {
+		panic("failed assert: window surface does not have expected dimensions")
+	}
+	cachedMandelbrotTexture, err = renderer.CreateTextureFromSurface(cachedMandelbrotSurface)
+	if err != nil {
+		panic(err)
+	}
 }
 
 func mandelbrotToRenderSurfaceCoord(inCoord complex128, mandelbrotRect sdl.FRect, renderSurfaceRect sdl.Rect) [2]int {
