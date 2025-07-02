@@ -1,6 +1,12 @@
 package main
 
-import "github.com/veandco/go-sdl2/sdl"
+import (
+	"encoding/gob"
+	"github.com/veandco/go-sdl2/sdl"
+	"io"
+	"os"
+	"runtime"
+)
 
 /*
 This will be the third iteration of the fractal viewer.
@@ -29,11 +35,50 @@ I suspect the following design decisions will help:
 - composing the final image of "render layers" which have an order
 - when render layers are updated, flag them as updated, then re-draw to the screen?
   - i want to avoid multiple concurrent event loops
+
+7/2/2025: Soooo given that I can't mix the SDL.Renderer with raw OpenGL access, I'll have to just use goroutines
+to speed up the fractal plot generation process. Using OpenCL was a bust and now OpenGL. Worst-case scenario at the
+end of my work on this when I want to optimize it, I just drop into C and use OpenCL there, and figure out how to
+interface with Go (maybe CGO.) That's gonna have to take a backseat.
+
+Instead of doing a zoom stack, I'm going to have the mouse click with a modifier guide the new rect selection.
 */
 
 /* 	general structure is as before: we render screens tied to a rect
 
  */
+
+// should check, if there's for some reason a fractalViewer3 folder already there (why would there be though?),
+// if the directory doesn't look like something this app created we'll just panic
+// i'm excited to get to work on GUI error dialogs
+
+const SettingsPathWindows = "%USERPROFILE%\\AppData\\Local\\fractalViewer3\\"
+const SettingsPathNix = "$HOME/.fractalViewer3/"
+
+func getGobEncoderDecoderPair(i io.Reader, o io.Writer) (*gob.Encoder, *gob.Decoder) {
+	var enc = gob.NewEncoder(o)
+	var dec = gob.NewDecoder(i)
+
+	return enc, dec
+}
+
+type Scene struct {
+	update      func(*Scene, *ProgramContext)
+	render      func(*Scene, *ProgramContext)
+	handleEvent func(*Scene, *ProgramContext, *inputStateType)
+	destroy     func(*Scene)
+
+	data interface{}
+
+	dataIsReady func(*Scene) bool
+}
+
+func validateScene(s *Scene) bool {
+	if s.update == nil || s.render == nil || s.handleEvent == nil || s.destroy == nil {
+		return false
+	}
+	return true
+}
 
 type Widget struct {
 	X, Y, W, H int32
@@ -52,12 +97,66 @@ type rootWidgetData struct {
 }
 
 type ProgramContext struct {
-	window   *sdl.Window
-	renderer *sdl.Renderer
+	window            *sdl.Window
+	renderer          *sdl.Renderer
+	settingsEncoder   *gob.Encoder
+	settingsDecoder   *gob.Decoder
+	settingsOutBuffer *[]byte
+	programSettings   *ProgramSettings
+}
+type ProgramSettings struct {
+	colorPalette []sdl.Color
+	view         *sdl.FRect
+	windowW      int32
+	windowH      int32
+}
+
+func getInitProgramSettings() *ProgramSettings {
+	return &ProgramSettings{
+		colorPalette: []sdl.Color{},
+		view:         &sdl.FRect{-2, -1.5, 4, 3},
+		windowW:      640,
+		windowH:      480,
+	}
+}
+
+// config not human readable for now
+// also dooooes this introduce any security concerns?
+func saveProgramSettings(p *ProgramSettings) error {
+	if runtime.GOOS == "windows" {
+		err := os.MkdirAll(SettingsPathWindows, 0755)
+		if err != nil {
+			panic(err) // this will need to be adjusted - a panic in this case is not very graceful
+		}
+		err = os.WriteFile(SettingsPathWindows+"config", byte(*p), 0644)
+		if err != nil {
+			panic(err)
+		}
+	} else {
+		// someone on stackoverflow said this was fine for all non-windows systems. there might be edge cases I
+		// need to consider.
+		err := os.MkdirAll(SettingsPathNix, 0755)
+		if err != nil {
+			panic(err)
+		}
+		err = os.WriteFile(SettingsPathNix+"config", []byte(*p), 0644)
+		if err != nil {
+			panic(err)
+		}
+	}
+	return nil
+}
+
+func loadProgramSettings() (*ProgramSettings, error) {
+
 }
 
 func validateProgramContext(p *ProgramContext) bool {
-	if p.window == nil || p.renderer == nil {
+	if p.window == nil || p.renderer == nil || p.programSettings == nil {
+		return false
+	}
+	// broken into two lines, but in spirit it's one statement
+	if p.settingsEncoder == nil || p.settingsDecoder == nil || p.settingsOutBuffer == nil {
 		return false
 	}
 	return true
@@ -96,6 +195,10 @@ func validateWidgetAndChildren(w *Widget) bool {
 	return true
 }
 
+type initSceneData struct {
+	widgets []*Widget
+}
+
 func main() {
 	// the OpenCL route i intended to go down is ineffective due to the (apparent) inadequacy of existing Go OpenCL
 	// bindings. so instead I'm going to use either GLSL or a CPU/multi-goroutine based method
@@ -115,7 +218,7 @@ func main() {
 		panic(err)
 	}
 	window.SetTitle("fractal viewer prototype 3!!! :DDD")
-	// setup
+	// setup rootWidget
 	var rootWidget = Widget{
 		X: 0,
 		Y: 0,
@@ -197,9 +300,13 @@ func main() {
 	}
 
 	var programContext = ProgramContext{
-		window:   window,
-		renderer: renderer,
+		window:            window,
+		renderer:          renderer,
+		settingsOutBuffer: &[]byte{},
+		programSettings:   getInitProgramSettings(),
 	}
+
+	getGobEncoderDecoderPair(programContext.programSettings)
 
 	if !validateWidgetAndChildren(&rootWidget) {
 		panic("failed assert: rootWidget failed to validate")
@@ -210,11 +317,73 @@ func main() {
 
 	var inputState inputStateType = inputStateType{}
 
-	rootWidget.handleEvent(&rootWidget, &programContext, &inputState)
-	if !rootWidget.dataIsReady(&rootWidget) {
-		panic("failed assert: rootWidget data not ready when needed")
+	// set up initScene
+	var initScene = Scene{}
+
+	initScene.data = &initSceneData{
+		widgets: []*Widget{&rootWidget},
 	}
-	rootWidget.render(&rootWidget, &programContext)
+
+	initScene.dataIsReady = func(s *Scene) bool {
+		if s.data.(*initSceneData).widgets != nil {
+			return true
+		}
+		return false
+	}
+
+	initScene.update = func(s *Scene, p *ProgramContext) {
+		// pass
+	}
+
+	initScene.handleEvent = func(s *Scene, p *ProgramContext, i *inputStateType) {
+		if !s.dataIsReady(s) {
+			panic("failed assert: data not ready when initScene.update() called")
+		}
+		for _, w := range s.data.(*initSceneData).widgets {
+			w.handleEvent(w, &programContext, i)
+		}
+	}
+
+	initScene.render = func(s *Scene, p *ProgramContext) {
+		if !s.dataIsReady(s) {
+			panic("failed assert: data not ready when initScene.render() called")
+		}
+		for _, w := range s.data.(*initSceneData).widgets {
+			w.render(w, p)
+		}
+	}
+	initScene.destroy = func(s *Scene) {
+		// let the GC handle it but make the program panic if it's used again (could be wasteful)
+		// there's still a chance the data can be accessed after the fact...
+		s.handleEvent = func(w *Scene, p *ProgramContext, state *inputStateType) {
+			panic("failed assert: scene method called after destroy called (handleEvent)")
+		}
+		s.render = func(s *Scene, p *ProgramContext) {
+			panic("failed assert: scene method called after destroy called (render)")
+		}
+		s.update = func(s *Scene, p *ProgramContext) {
+			panic("failed assert: scene method called after destroy called (update)")
+		}
+		s.dataIsReady = func(s *Scene) bool {
+			panic("failed assert: scene method called after destroy called (dataIsReady)")
+		}
+		// uhh is this going to cause problems given I'm updating s.destroy() with s.destroy()?
+		s.destroy = func(s *Scene) {
+			panic("failed assert: scene method called after destroy called (destroy, ironically)")
+		}
+	}
+
+	if !validateScene(&initScene) {
+		panic("failed assert: failed to validate initScene")
+	}
+
+	/* if !rootWidget.dataIsReady(&rootWidget) {
+		panic("failed assert: rootWidget data not ready when needed")
+	} */
+
+	/* rootWidget.render(&rootWidget, &programContext) */
+	initScene.handleEvent(&initScene, &programContext, &inputState)
+	initScene.render(&initScene, &programContext)
 
 	// main event loop
 	for e := sdl.PollEvent(); true; e = sdl.PollEvent() {
