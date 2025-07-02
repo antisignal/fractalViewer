@@ -1,9 +1,8 @@
 package main
 
 import (
-	"encoding/gob"
+	"encoding/json"
 	"github.com/veandco/go-sdl2/sdl"
-	"io"
 	"os"
 	"runtime"
 )
@@ -55,11 +54,42 @@ Instead of doing a zoom stack, I'm going to have the mouse click with a modifier
 const SettingsPathWindows = "%USERPROFILE%\\AppData\\Local\\fractalViewer3\\"
 const SettingsPathNix = "$HOME/.fractalViewer3/"
 
-func getGobEncoderDecoderPair(i io.Reader, o io.Writer) (*gob.Encoder, *gob.Decoder) {
-	var enc = gob.NewEncoder(o)
-	var dec = gob.NewDecoder(i)
+type SceneStack struct {
+	scenes []*Scene
+}
 
-	return enc, dec
+func (s *SceneStack) Push(scene *Scene, programContext *ProgramContext) {
+	var top = s.Top()
+	top.pause(top, programContext)
+	scene.resume(scene, programContext)
+	s.scenes = append(s.scenes, scene)
+}
+func (s *SceneStack) Pop(programContext *ProgramContext) *Scene {
+	stackLen := len(s.scenes)
+	if stackLen == 0 {
+		return nil
+	}
+	var popped = s.scenes[stackLen-1]
+	popped.pause(popped, programContext)
+	s.scenes = s.scenes[:stackLen-2] // check for off by one here
+	var newTop = s.Top()
+	newTop.resume(newTop, programContext)
+	return popped
+}
+func (s *SceneStack) Top() *Scene {
+	stackLen := len(s.scenes)
+	if stackLen == 0 {
+		return nil
+	}
+	return s.scenes[stackLen-1]
+}
+func (s *SceneStack) Replace(newScene *Scene, programContext *ProgramContext) {
+	var replaced = s.Top()
+	replaced.pause(replaced, programContext)
+	var scenesLen = len(s.scenes)
+	s.scenes = s.scenes[:scenesLen-2]
+	s.scenes = append(s.scenes, newScene)
+	newScene.resume(newScene, programContext)
 }
 
 type Scene struct {
@@ -67,6 +97,8 @@ type Scene struct {
 	render      func(*Scene, *ProgramContext)
 	handleEvent func(*Scene, *ProgramContext, *inputStateType)
 	destroy     func(*Scene)
+	pause       func(*Scene, *ProgramContext)
+	resume      func(*Scene, *ProgramContext)
 
 	data interface{}
 
@@ -75,6 +107,9 @@ type Scene struct {
 
 func validateScene(s *Scene) bool {
 	if s.update == nil || s.render == nil || s.handleEvent == nil || s.destroy == nil {
+		return false
+	}
+	if s.pause == nil || s.resume == nil {
 		return false
 	}
 	return true
@@ -97,38 +132,42 @@ type rootWidgetData struct {
 }
 
 type ProgramContext struct {
-	window            *sdl.Window
-	renderer          *sdl.Renderer
-	settingsEncoder   *gob.Encoder
-	settingsDecoder   *gob.Decoder
-	settingsOutBuffer *[]byte
-	programSettings   *ProgramSettings
+	window          *sdl.Window
+	renderer        *sdl.Renderer
+	programSettings *ProgramSettings
 }
 type ProgramSettings struct {
-	colorPalette []sdl.Color
-	view         *sdl.FRect
-	windowW      int32
-	windowH      int32
+	ColorPalette       []sdl.Color
+	View               *sdl.FRect
+	WindowW            int32
+	WindowH            int32
+	TestRectangleColor sdl.Color
 }
 
 func getInitProgramSettings() *ProgramSettings {
 	return &ProgramSettings{
-		colorPalette: []sdl.Color{},
-		view:         &sdl.FRect{-2, -1.5, 4, 3},
-		windowW:      640,
-		windowH:      480,
+		ColorPalette:       []sdl.Color{},
+		View:               &sdl.FRect{-2, -1.5, 4, 3},
+		WindowW:            640,
+		WindowH:            480,
+		TestRectangleColor: sdl.Color{0, 0, 255, 255},
 	}
 }
 
 // config not human readable for now
 // also dooooes this introduce any security concerns?
 func saveProgramSettings(p *ProgramSettings) error {
+	var settingsString, err = json.Marshal(*p)
+	if err != nil {
+		panic("failed to marshal json: " + err.Error())
+	}
+
 	if runtime.GOOS == "windows" {
 		err := os.MkdirAll(SettingsPathWindows, 0755)
 		if err != nil {
 			panic(err) // this will need to be adjusted - a panic in this case is not very graceful
 		}
-		err = os.WriteFile(SettingsPathWindows+"config", byte(*p), 0644)
+		err = os.WriteFile(SettingsPathWindows+"config", settingsString, 0644)
 		if err != nil {
 			panic(err)
 		}
@@ -139,7 +178,7 @@ func saveProgramSettings(p *ProgramSettings) error {
 		if err != nil {
 			panic(err)
 		}
-		err = os.WriteFile(SettingsPathNix+"config", []byte(*p), 0644)
+		err = os.WriteFile(SettingsPathNix+"config", settingsString, 0644)
 		if err != nil {
 			panic(err)
 		}
@@ -147,16 +186,42 @@ func saveProgramSettings(p *ProgramSettings) error {
 	return nil
 }
 
-func loadProgramSettings() (*ProgramSettings, error) {
+func initSettingsFile() {
+	err := saveProgramSettings(getInitProgramSettings())
+	if err != nil {
+		panic(err)
+	}
+}
 
+func loadProgramSettings() (*ProgramSettings, error) {
+	var loadedProgramSettingsString []byte
+	if runtime.GOOS == "windows" {
+		var err error
+		// this works but I can't find it in windows explorer. i'll just roll with it for now...
+		loadedProgramSettingsString, err = os.ReadFile(SettingsPathWindows + "config")
+		if err != nil {
+			// maybe create a new settings file instead?
+			return nil, err
+		}
+	} else {
+		// same issue as before with this maybe working for all non windows oses or maybe not
+		var err error
+		loadedProgramSettingsString, err = os.ReadFile(SettingsPathNix + "config")
+		if err != nil {
+			// maybe create a new settings file outside of this function?
+			return nil, err
+		}
+	}
+	loadedProgramSettings := &ProgramSettings{}
+	err := json.Unmarshal(loadedProgramSettingsString, &loadedProgramSettings)
+	if err != nil {
+		panic(err)
+	}
+	return loadedProgramSettings, nil
 }
 
 func validateProgramContext(p *ProgramContext) bool {
 	if p.window == nil || p.renderer == nil || p.programSettings == nil {
-		return false
-	}
-	// broken into two lines, but in spirit it's one statement
-	if p.settingsEncoder == nil || p.settingsDecoder == nil || p.settingsOutBuffer == nil {
 		return false
 	}
 	return true
@@ -280,7 +345,9 @@ func main() {
 				}
 			}()
 			previousDrawColorR, previousDrawColorG, previousDrawColorB, previousDrawColorA, err := p.renderer.GetDrawColor()
-			err = p.renderer.SetDrawColor(255, 0, 0, 255)
+			var settingsColor = p.programSettings.TestRectangleColor
+			// err = p.renderer.SetDrawColor(255, 0, 0, 255)
+			err = p.renderer.SetDrawColor(settingsColor.R, settingsColor.G, settingsColor.B, settingsColor.A)
 			if err != nil {
 				panic(err)
 			}
@@ -300,13 +367,10 @@ func main() {
 	}
 
 	var programContext = ProgramContext{
-		window:            window,
-		renderer:          renderer,
-		settingsOutBuffer: &[]byte{},
-		programSettings:   getInitProgramSettings(),
+		window:          window,
+		renderer:        renderer,
+		programSettings: getInitProgramSettings(),
 	}
-
-	getGobEncoderDecoderPair(programContext.programSettings)
 
 	if !validateWidgetAndChildren(&rootWidget) {
 		panic("failed assert: rootWidget failed to validate")
@@ -372,16 +436,42 @@ func main() {
 			panic("failed assert: scene method called after destroy called (destroy, ironically)")
 		}
 	}
+	initScene.pause = func(s *Scene, p *ProgramContext) {}
+	initScene.resume = func(s *Scene, p *ProgramContext) {}
 
 	if !validateScene(&initScene) {
 		panic("failed assert: failed to validate initScene")
 	}
 
-	/* if !rootWidget.dataIsReady(&rootWidget) {
-		panic("failed assert: rootWidget data not ready when needed")
+	// load settings
+	programContext.programSettings, err = loadProgramSettings()
+	if err != nil {
+		initSettingsFile()
+		programContext.programSettings, err = loadProgramSettings()
+		if err != nil {
+			// maybe fall back to default settings without file?
+			panic("could not create settings file: " + err.Error())
+		}
+	}
+
+	// skipping this test for now
+
+	/* quick test
+	err = saveProgramSettings(programContext.programSettings)
+	if err != nil {
+		panic(err)
+	}
+	loadedProgramSettings, err := loadProgramSettings()
+	if err != nil {
+		panic(err)
+	}
+
+	if *loadedProgramSettings != *programContext.programSettings {
+		panic("failed assert: program settings change after save and load")
 	} */
 
-	/* rootWidget.render(&rootWidget, &programContext) */
+	// do the actual stuff we want to
+
 	initScene.handleEvent(&initScene, &programContext, &inputState)
 	initScene.render(&initScene, &programContext)
 
@@ -421,5 +511,7 @@ func handleInputEvent(inputState *inputStateType, e sdl.Event) {
 		case sdl.BUTTON_MIDDLE:
 			inputState.mouseButtons[mouseButtonMiddle] = state
 		}
+	case *sdl.QuitEvent:
+		os.Exit(0)
 	}
 }
