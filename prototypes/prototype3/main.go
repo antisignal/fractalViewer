@@ -3,8 +3,10 @@ package main
 import (
 	"encoding/json"
 	"github.com/veandco/go-sdl2/sdl"
+	"math"
 	"os"
 	"runtime"
+	"sort"
 )
 
 /*
@@ -54,6 +56,73 @@ Instead of doing a zoom stack, I'm going to have the mouse click with a modifier
 const SettingsPathWindows = "%USERPROFILE%\\AppData\\Local\\fractalViewer3\\"
 const SettingsPathNix = "$HOME/.fractalViewer3/"
 
+type ColorMethod int
+
+type ControlPointsColorPalette []ControlPointsPaletteEntry
+type ModuloColorPalette []ModuloPaletteEntry
+
+type ColorPalette struct {
+	controlPointsColorPalette *ControlPointsColorPalette
+	moduloColorPalette        *ModuloColorPalette
+}
+
+const (
+	ColorMethodControlPoints = iota
+	ColorMethodModulo        = iota
+)
+
+type ModuloPaletteEntry struct {
+	color  *sdl.Color
+	modulo int
+}
+
+type ControlPointsPaletteEntry struct {
+	color        *sdl.Color
+	controlPoint float32
+}
+
+func (c *ColorPalette) sortAndValidateColorPalette() bool {
+	// validate
+	if c.controlPointsColorPalette != nil {
+		var seenInControlPointsPalette = make(map[float32]bool)
+		for _, x := range *c.controlPointsColorPalette {
+			_, ok := seenInControlPointsPalette[x.controlPoint]
+			if ok {
+				return false
+			}
+			seenInControlPointsPalette[x.controlPoint] = true
+		}
+	}
+
+	if c.moduloColorPalette != nil {
+		var lenMCP = len(*c.moduloColorPalette)
+		var seenInModuloPalette = make(map[int]bool)
+		for _, x := range *c.moduloColorPalette {
+			if x.modulo > lenMCP-1 || x.modulo < 0 {
+				return false
+			}
+			_, ok := seenInModuloPalette[x.modulo]
+			if ok {
+				return false
+			}
+			seenInModuloPalette[x.modulo] = true
+		}
+	}
+
+	// sort
+	if c.controlPointsColorPalette != nil {
+		sort.Slice(c.controlPointsColorPalette, func(i, j int) bool {
+			return (*c.controlPointsColorPalette)[i].controlPoint < (*c.controlPointsColorPalette)[j].controlPoint
+		})
+	}
+	if c.moduloColorPalette != nil {
+		sort.Slice(c.moduloColorPalette, func(i, j int) bool {
+			return (*c.moduloColorPalette)[i].modulo < (*c.moduloColorPalette)[j].modulo
+		})
+	}
+	return true
+}
+
 type SceneStack struct {
 	scenes []*Scene
 }
@@ -102,7 +171,7 @@ type Scene struct {
 
 	data interface{}
 
-	dataIsReady func(*Scene) bool
+	dataIsReady func(*Scene, *ProgramContext) bool
 }
 
 func validateScene(s *Scene) bool {
@@ -120,15 +189,40 @@ type Widget struct {
 	parent     *Widget
 	children   []*Widget
 
-	data interface{}
+	data     interface{}
+	initData func(*Widget, *ProgramContext)
 
 	render      func(*Widget, *ProgramContext)
 	handleEvent func(*Widget, *ProgramContext, *inputStateType)
-	dataIsReady func(*Widget) bool
+	dataIsReady func(*Widget, *ProgramContext) bool
+	dataIsSane  func(*Widget, *ProgramContext) bool // HACK: is there a meaningful distinction to be made here?
 }
 
-type rootWidgetData struct {
-	cachedTexture *sdl.Texture
+func (w *Widget) registerChildWidget(child *Widget) {
+	w.children = append(w.children, child)
+	child.parent = w
+}
+
+func getAbsolutePosition(w *Widget) [2]int32 {
+	var relativePosition = [2]int32{w.X, w.Y}
+	var parentAbsolutePosition [2]int32
+	if w.parent != nil {
+		parentAbsolutePosition = getAbsolutePosition(w.parent)
+	} else {
+		parentAbsolutePosition = [2]int32{} // (0,0)
+	}
+	var absolutePosition = [2]int32{
+		relativePosition[0] + parentAbsolutePosition[0],
+		relativePosition[1] + parentAbsolutePosition[1],
+	}
+	return absolutePosition
+}
+
+type rootWidgetData struct{}
+
+type plotWidgetData struct {
+	cachedTexture    *sdl.Texture
+	cachedPlotValues *[]int16 // as a sanity check this should be [...].programSettings.
 }
 
 type ProgramContext struct {
@@ -137,20 +231,73 @@ type ProgramContext struct {
 	programSettings *ProgramSettings
 }
 type ProgramSettings struct {
-	ColorPalette       []sdl.Color
-	View               *sdl.FRect
-	WindowW            int32
-	WindowH            int32
-	TestRectangleColor sdl.Color
+	ColorPalette            *ColorPalette
+	View                    *sdl.FRect
+	WindowW                 int32
+	WindowH                 int32
+	TestRectangleColor      sdl.Color
+	PlotResX                int32
+	PlotResY                int32
+	MaxMandelbrotIterations int16
+	PreferredColorMethod    ColorMethod
 }
 
 func getInitProgramSettings() *ProgramSettings {
 	return &ProgramSettings{
-		ColorPalette:       []sdl.Color{},
-		View:               &sdl.FRect{-2, -1.5, 4, 3},
-		WindowW:            640,
-		WindowH:            480,
-		TestRectangleColor: sdl.Color{0, 0, 255, 255},
+		// en.wikipedia.org/wiki/Color_gradient#/media/File:20180522_Color_palette_for_warming_stripes_-_ColorBrewer_9-class_single_hue.svg
+		/* ColorPalette: []*sdl.Color{
+			{33, 113, 181, 255},  // color -6, range 0-127
+			{107, 174, 214, 255}, // color -4, range 128-255
+			{198, 219, 239, 255}, // color -2
+			{255, 255, 255, 255}, // color 0
+			{252, 187, 161, 255}, // color +2
+			{251, 106, 74, 255},  // color +4
+			{203, 24, 29, 255},   // color +6
+			{103, 0, 13, 255},    // color +8
+		}, */
+		// https://stackoverflow.com/questions/16500656/which-color-gradient-is-used-to-color-mandelbrot-in-wikipedia
+		/* ColorPalette: &ColorPalette{
+		&ControlPointsColorPalette{
+			ControlPointsPaletteEntry{
+				color:        &sdl.Color{0, 7, 100, 255},
+				controlPoint: 0.0,
+			},
+			ControlPointsPaletteEntry{
+				color:        &sdl.Color{32, 107, 203, 255},
+				controlPoint: 0.16,
+			},
+			ControlPointsPaletteEntry{
+				color: &sdl.Color{237,255,255},
+			},
+		}, [...] */
+		ColorPalette: &ColorPalette{
+			controlPointsColorPalette: nil,
+			moduloColorPalette: &ModuloColorPalette{
+				ModuloPaletteEntry{&sdl.Color{25, 7, 26, 255}, 1},
+				ModuloPaletteEntry{&sdl.Color{9, 1, 47, 255}, 2},
+				ModuloPaletteEntry{&sdl.Color{4, 4, 73, 255}, 3},
+				ModuloPaletteEntry{&sdl.Color{0, 7, 100, 255}, 4},
+				ModuloPaletteEntry{&sdl.Color{12, 44, 138, 255}, 5},
+				ModuloPaletteEntry{&sdl.Color{24, 82, 177, 255}, 6},
+				ModuloPaletteEntry{&sdl.Color{57, 125, 209, 255}, 7},
+				ModuloPaletteEntry{&sdl.Color{134, 181, 229, 255}, 8},
+				ModuloPaletteEntry{&sdl.Color{211, 236, 248, 255}, 9},
+				ModuloPaletteEntry{&sdl.Color{241, 233, 191, 255}, 10},
+				ModuloPaletteEntry{&sdl.Color{248, 201, 95, 255}, 11},
+				ModuloPaletteEntry{&sdl.Color{255, 170, 0, 255}, 12},
+				ModuloPaletteEntry{&sdl.Color{204, 128, 0, 255}, 13},
+				ModuloPaletteEntry{&sdl.Color{153, 87, 0, 255}, 14},
+				ModuloPaletteEntry{&sdl.Color{106, 52, 3, 255}, 15},
+			},
+		},
+		PreferredColorMethod:    ColorMethodModulo,
+		View:                    &sdl.FRect{-2, -1.5, 4, 3},
+		WindowW:                 640,
+		WindowH:                 480,
+		TestRectangleColor:      sdl.Color{0, 0, 255, 255},
+		PlotResX:                640,
+		PlotResY:                480,
+		MaxMandelbrotIterations: 1024,
 	}
 }
 
@@ -290,25 +437,36 @@ func main() {
 		W: windowW,
 		H: windowH,
 
-		data: &rootWidgetData{
-			cachedTexture: nil,
-		},
+		data: &rootWidgetData{},
 
 		parent:      nil,
 		children:    []*Widget{},
 		render:      nil,
 		handleEvent: nil,
-		dataIsReady: func(w *Widget) bool {
-			var wData = w.data.(*rootWidgetData)
+		dataIsReady: func(w *Widget, p *ProgramContext) bool {
+			/* var wData, ok = w.data.(*rootWidgetData)
+			// panic here or just return false?
+			if !ok {
+				panic("failed assertion: type assertion of rootWidget data failed!")
+			}
 			if wData.cachedTexture == nil {
 				return false
+			} */
+			for _, child := range w.children {
+				if !child.dataIsReady(child, p) {
+					return false
+				}
 			}
 			return true
 		},
 	}
 
 	rootWidget.render = func(w *Widget, p *ProgramContext) {
-		var tex = w.data.(*rootWidgetData).cachedTexture
+		/* var data, ok = w.data.(*rootWidgetData)
+		if !ok {
+			panic("failed assertion: type assertion of rootWidget data failed!")
+		}
+		var tex = data.cachedTexture
 		// on nil texture, panic instead of trying to continue. this probably means something's wrong
 		if tex == nil {
 			panic("failed to render rootWidget texture (nil reference and no fallback)")
@@ -325,15 +483,21 @@ func main() {
 		if err != nil {
 			panic("renderer failed to copy texture in rootWidget render: " + err.Error())
 		}
-		p.renderer.Present()
+		p.renderer.Present() */
+		for _, child := range w.children {
+			child.render(child, p)
+		}
 	}
 	rootWidget.handleEvent = func(w *Widget, p *ProgramContext, state *inputStateType) {
 		// asserts are assumed to pass, but it's possible to change the dimensions of the texture at runtime and I don't like that.
-		// maybe there's a solution somewhere
+		// maybe there's a solution somewhere (7/2/25: should I have a dataSanityCheck function?)
 		// placeholder
-		data := w.data.(*rootWidgetData)
-		if data.cachedTexture == nil {
-			w.data.(*rootWidgetData).cachedTexture, err = p.renderer.CreateTexture(sdl.PIXELFORMAT_RGBA8888, sdl.TEXTUREACCESS_TARGET, w.W, w.H)
+		/* data, ok := w.data.(*rootWidgetData)
+		if !ok {
+			panic("failed assert: type assertion of rootWidget data failed!")
+		}
+		 if data.cachedTexture == nil {
+			data.cachedTexture, err = p.renderer.CreateTexture(sdl.PIXELFORMAT_RGBA8888, sdl.TEXTUREACCESS_TARGET, w.W, w.H)
 			err = p.renderer.SetRenderTarget(data.cachedTexture)
 			if err != nil {
 				panic(err)
@@ -362,7 +526,110 @@ func main() {
 				panic(err)
 			}
 		} else {
-			err = p.renderer.Copy(w.data.(*rootWidgetData).cachedTexture, &sdl.Rect{0, 0, w.W, w.H}, &sdl.Rect{w.X, w.Y, w.W, w.H})
+			err = p.renderer.Copy(data.cachedTexture, &sdl.Rect{0, 0, w.W, w.H}, &sdl.Rect{w.X, w.Y, w.W, w.H})
+		} */
+		for _, child := range w.children {
+			child.handleEvent(child, p, state)
+		}
+	}
+
+	var plotWidget = Widget{
+		// all coords of parent children are specified relative to parent. not implementing disown/adopt feature
+		X: 0,
+		Y: 0,
+		W: rootWidget.W,
+		H: rootWidget.H,
+
+		parent:   &rootWidget,
+		children: []*Widget{},
+
+		data: &plotWidgetData{},
+	}
+	rootWidget.initData = func(w *Widget, p *ProgramContext) {
+		for _, child := range w.children {
+			child.initData(child, p)
+		}
+	}
+	rootWidget.registerChildWidget(&plotWidget)
+	plotWidget.render = func(w *Widget, p *ProgramContext) {
+		// where we'll do the main mandelbrot plot rendering (from cache)
+
+		if !w.dataIsReady(w, p) {
+			panic("failed assert: plotWidget data accessed before ready")
+		}
+		if p.renderer.GetRenderTarget() != nil {
+			panic("failed assert: render target not nil in plotWidget render!")
+		}
+		data, ok := w.data.(*plotWidgetData)
+		if !ok {
+			panic("failed assert: type assertion failed on plotWidget data!")
+		}
+		var tex = data.cachedTexture
+		if tex == nil {
+			panic("failed assert: texture used before created")
+		}
+		_, _, texW, texH, err := tex.Query()
+		if err != nil {
+			panic(err)
+		}
+		if texW != plotWidget.W || texH != plotWidget.H {
+			panic("failed assert: plotWidget dimensions not the same as texture dimensions")
+		}
+		// copy from the bounds of the texture to the absolute rect
+		var absolutePosition = getAbsolutePosition(w)
+
+		err = p.renderer.Copy(tex, &sdl.Rect{
+			0, 0, plotWidget.W, plotWidget.H}, &sdl.Rect{
+			absolutePosition[0], absolutePosition[1], plotWidget.W, plotWidget.H})
+		p.renderer.Present()
+	}
+	plotWidget.handleEvent = func(w *Widget, p *ProgramContext, i *inputStateType) {
+		// for now, just regen the plot without taking events into account
+		// i need to refactor this to have a dataIsReady() and dataIsSane()
+		var data, ok = w.data.(*plotWidgetData)
+		if !ok {
+			panic("failed assert: type assertion failed on plotWidget data!")
+		}
+		if len(*data.cachedPlotValues) != int(p.programSettings.PlotResX)*int(p.programSettings.PlotResY) {
+			panic("failed assert: len of cachedPlotValues does not match settings!")
+		}
+		data.cachedPlotValues = regenPlotValues(p)
+		colorPlotWidgetTextureFromValues(w, p)
+		w.render(w, p)
+	}
+	// should I do dataIsReady and dataIsSane?
+	plotWidget.dataIsReady = func(w *Widget, p *ProgramContext) bool {
+		// this assumes we don't need to check if the plot data is of the appropriate type before saying the data is ready
+		if w.data == nil {
+			return false
+		}
+		data, ok := w.data.(*plotWidgetData)
+		if !ok {
+			return false
+		}
+		if data.cachedTexture == nil {
+			return false
+		}
+		// going for a flat array for performance reasons
+		if len(*data.cachedPlotValues) != int(p.programSettings.PlotResX*p.programSettings.PlotResY) {
+			panic("failed assert: len of cachedPlotValues doesn't match settings!")
+		}
+		return true
+	}
+	plotWidget.initData = func(w *Widget, p *ProgramContext) {
+		var data, ok = w.data.(*plotWidgetData)
+		if !ok {
+			panic("failed assert: data not plotWidgetData in plotWidget.initData()")
+		}
+		if data.cachedTexture == nil {
+			data.cachedTexture, err = p.renderer.CreateTexture(sdl.PIXELFORMAT_RGBA8888, sdl.TEXTUREACCESS_TARGET, p.programSettings.PlotResX, p.programSettings.PlotResY)
+			if err != nil {
+				panic(err)
+			}
+		}
+		if data.cachedPlotValues == nil {
+			var blankPlotValues = make([]int16, p.programSettings.PlotResX*p.programSettings.PlotResY)
+			data.cachedPlotValues = &blankPlotValues
 		}
 	}
 
@@ -371,6 +638,8 @@ func main() {
 		renderer:        renderer,
 		programSettings: getInitProgramSettings(),
 	}
+
+	rootWidget.initData(&rootWidget, &programContext)
 
 	if !validateWidgetAndChildren(&rootWidget) {
 		panic("failed assert: rootWidget failed to validate")
@@ -388,9 +657,18 @@ func main() {
 		widgets: []*Widget{&rootWidget},
 	}
 
-	initScene.dataIsReady = func(s *Scene) bool {
-		if s.data.(*initSceneData).widgets != nil {
+	initScene.dataIsReady = func(s *Scene, p *ProgramContext) bool {
+		var data, ok = s.data.(*initSceneData)
+		if !ok {
+			panic("failed assert: type assertion on initScene data failed!")
+		}
+		if data.widgets != nil {
 			return true
+		}
+		for _, w := range data.widgets {
+			if !w.dataIsReady(w, p) {
+				return false
+			}
 		}
 		return false
 	}
@@ -400,7 +678,7 @@ func main() {
 	}
 
 	initScene.handleEvent = func(s *Scene, p *ProgramContext, i *inputStateType) {
-		if !s.dataIsReady(s) {
+		if !s.dataIsReady(s, p) {
 			panic("failed assert: data not ready when initScene.update() called")
 		}
 		for _, w := range s.data.(*initSceneData).widgets {
@@ -409,7 +687,7 @@ func main() {
 	}
 
 	initScene.render = func(s *Scene, p *ProgramContext) {
-		if !s.dataIsReady(s) {
+		if !s.dataIsReady(s, p) {
 			panic("failed assert: data not ready when initScene.render() called")
 		}
 		for _, w := range s.data.(*initSceneData).widgets {
@@ -428,7 +706,7 @@ func main() {
 		s.update = func(s *Scene, p *ProgramContext) {
 			panic("failed assert: scene method called after destroy called (update)")
 		}
-		s.dataIsReady = func(s *Scene) bool {
+		s.dataIsReady = func(s *Scene, p *ProgramContext) bool {
 			panic("failed assert: scene method called after destroy called (dataIsReady)")
 		}
 		// uhh is this going to cause problems given I'm updating s.destroy() with s.destroy()?
@@ -446,12 +724,14 @@ func main() {
 	// load settings
 	programContext.programSettings, err = loadProgramSettings()
 	if err != nil {
-		initSettingsFile()
+		programContext.programSettings = getInitProgramSettings()
+		// save later, now that it works
+		/*initSettingsFile()
 		programContext.programSettings, err = loadProgramSettings()
 		if err != nil {
 			// maybe fall back to default settings without file?
 			panic("could not create settings file: " + err.Error())
-		}
+		} */
 	}
 
 	// skipping this test for now
@@ -514,4 +794,174 @@ func handleInputEvent(inputState *inputStateType, e sdl.Event) {
 	case *sdl.QuitEvent:
 		os.Exit(0)
 	}
+}
+
+func regenPlotValues(p *ProgramContext) *[]int16 {
+	// this might be expensive...
+	var out = make([]int16, p.programSettings.PlotResX*p.programSettings.PlotResY)
+
+	for i := range out {
+		if i > math.MaxInt32 {
+			// off by one maybe but it's inconsequential right now
+			panic("failed assert: more than MaxInt32 + 1 values in plot!")
+		}
+		// y coord
+		var quotient = int32(i) / p.programSettings.PlotResX
+		var remainder = int32(i) % p.programSettings.PlotResX
+		var currentPlotScreenCoord = [2]int32{remainder, quotient}
+		var currentPlotPlaneCoord = convertPlotScreenCoordToPlotPlane(currentPlotScreenCoord, p)
+		var currentPlotValue = calculatePlotValueFromPlaneCoord(currentPlotPlaneCoord, p)
+		out[i] = currentPlotValue
+	}
+	return &out
+}
+
+// plotScreen coord is in the range 0-PlotResX, 0-PlotResY
+// plotPlane coord is in the range PlotRangeRealLower-PlotRangeRealUpper, 0-PlotRangeImagLower, PlotRangeImageUpper
+func convertPlotScreenCoordToPlotPlane(c [2]int32, p *ProgramContext) complex64 {
+	// HACK: using sdl.FRect as our storage for float values limits our resolution to what float32 can support
+	var screenCoordXProportionOfResX = float32(c[0]) / float32(p.programSettings.PlotResX)
+	var screenCoordYProportionOfResY = float32(c[1]) / float32(p.programSettings.PlotResY)
+	var planeCoordRealShift = screenCoordXProportionOfResX * p.programSettings.View.W
+	var planeCoordImagShift = screenCoordYProportionOfResY * p.programSettings.View.H
+	var planeCoordRealAbsolutePosition = p.programSettings.View.X + planeCoordRealShift
+	var planeCoordImagAbsolutePosition = p.programSettings.View.Y + planeCoordImagShift
+	return complex(planeCoordRealAbsolutePosition, planeCoordImagAbsolutePosition)
+}
+
+func calculatePlotValueFromPlaneCoord(c complex64, p *ProgramContext) int16 {
+	// HACK: eventually we should replace this with a function that works for multiple fractals and continuous complex
+	// functions
+	// same as prototype 2
+	var z complex128 = complex(0, 0)
+	var i int16
+	for i = 0; i < p.programSettings.MaxMandelbrotIterations; i++ {
+		// slight inefficiency
+		var magnitude float64 = math.Sqrt((real(z) * real(z)) + (imag(z) * imag(z)))
+		if magnitude > 2 {
+			return i + 1 // starting with 1st iteration - unknown if this will cause problems
+		}
+		z = z*z + complex128(c)
+	}
+	return -1 // -1 reserved for when, after max iterations, it does not diverge (since I'm pretty sure it can diverge instantly/leaving i=0
+}
+
+func colorPlotWidgetTextureFromValues(w *Widget, p *ProgramContext) {
+	var initColor = [4]uint8{}
+	var err error
+	initColor[0], initColor[1], initColor[2], initColor[3], err = p.renderer.GetDrawColor()
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		err = p.renderer.SetDrawColor(initColor[0], initColor[1], initColor[2], initColor[3])
+		if err != nil {
+			panic(err)
+		}
+	}()
+
+	var data, ok = w.data.(*plotWidgetData)
+	if !ok {
+		panic("failed assert: type assertion of widget data failed for widget passed to colorPlotWidget[...]()" +
+			"(not a plotWidget?)")
+	}
+	if !w.dataIsReady(w, p) {
+		panic("failed assert: data in colorPlotWidget[...]() not ready when used")
+	}
+
+	if int(p.programSettings.PlotResX*p.programSettings.PlotResY)-len(*data.cachedPlotValues) < 0 {
+		panic("failed assert: last value of cachedPlotValues exceeds plot bounds per settings!")
+	}
+
+	err = p.renderer.SetRenderTarget(data.cachedTexture)
+	if err != nil {
+		panic(err)
+	}
+	defer func() {
+		err = p.renderer.SetRenderTarget(nil)
+		if err != nil {
+			panic(err)
+		}
+	}()
+
+	for i, x := range *data.cachedPlotValues {
+		/* XXX: if the size of the cachedPlotValues can differ from the size of the plot texture (I can't remember if it
+		does), when we try to index into it we'll end up with either this function writing to the top corner of the
+		texture and leaving the rest unchanged (if cPV is smaller) or an out of bounds panic.
+		there's an assert that these are supposed to be the same (screenCoord, planeCoord) but that's inconsistent with my intention
+		for different values for the screenCoord res and planeCoord res. */
+		// no assert necessary, but going to add it in case I change the int16 cachedPlotValues len to an int32
+		if i > math.MaxInt32 {
+			panic("failed assert: i greater than MaxInt32 in colorPlotWidget[...]()!")
+		}
+		var quotient = int32(i) / p.programSettings.PlotResX  // Y
+		var remainder = int32(i) % p.programSettings.PlotResX // X
+		// this assert can maybe just be done with the last value instead of tens of thousands of times...
+		/* if quotient > p.programSettings.PlotResY-1 || remainder > p.programSettings.PlotResX-1 {
+			panic("failed assert: quotient or remainder in colorPlotWidget[...]() exceeds screen bounds!")
+		} */
+		var color = getColorFromPlotValue(x, p)
+		var colorDereferenced = *color
+		err = p.renderer.SetDrawColor(colorDereferenced.R, colorDereferenced.G, colorDereferenced.B, colorDereferenced.A)
+		err = p.renderer.DrawPoint(remainder, quotient)
+	}
+}
+
+// HACK: this should be included in the palette as the non-escaping color.
+var ColorBlack = sdl.Color{0, 0, 0, 255}
+
+func getColorFromPlotValue(v int16, p *ProgramContext) *sdl.Color {
+	var colorMethod = chooseColorMethod(p)
+
+	if colorMethod == ColorMethodModulo {
+		if v == -1 {
+			return &ColorBlack
+		}
+		var lenMCP = len(*p.programSettings.ColorPalette.moduloColorPalette)
+		var colorIndex = int(v) % lenMCP
+		var mCP = p.programSettings.ColorPalette.moduloColorPalette
+		return (*mCP)[colorIndex].color
+	}
+	if colorMethod == ColorMethodControlPoints {
+		panic("control point coloring method not implemented yet")
+	}
+	panic("failed assert in getColorFromPlotValue(): chooseColorMethod didn't panic when it should have")
+
+	/*
+		var paletteLen = len(p.programSettings.ColorPalette)
+		if paletteLen > math.MaxInt16 {
+			panic("failed assert: too many colors in palette!!!")
+		}
+		if paletteLen == 0 {
+			panic("failed assert: empty palette given!")
+		}
+		// using the same technique I used in prototype2
+
+		_, ok := p.colorMemo */
+
+	/*
+		var paletteStep = p.programSettings.MaxMandelbrotIterations / int16(paletteLen)
+		var paletteStepRemainder = p.programSettings.MaxMandelbrotIterations % int16(paletteLen)
+		if paletteStepRemainder != 0 {
+			panic("failed assert: max iterations not cleanly divisible by length of palette!")
+		}
+		var indexIntoPalette = int(v / paletteStep)
+		return p.programSettings.ColorPalette[indexIntoPalette] */
+}
+
+func chooseColorMethod(p *ProgramContext) ColorMethod {
+	if p.programSettings.ColorPalette.moduloColorPalette != nil {
+		if p.programSettings.ColorPalette.moduloColorPalette == nil {
+			return ColorMethodModulo
+		}
+		if p.programSettings.PreferredColorMethod == ColorMethodModulo {
+			return ColorMethodModulo
+		} else {
+			return ColorMethodControlPoints
+		}
+	}
+	if p.programSettings.ColorPalette.controlPointsColorPalette != nil {
+		return ColorMethodControlPoints
+	}
+	panic("error: no color method available!! ;-;")
 }
