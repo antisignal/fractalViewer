@@ -43,6 +43,9 @@ end of my work on this when I want to optimize it, I just drop into C and use Op
 interface with Go (maybe CGO.) That's gonna have to take a backseat.
 
 Instead of doing a zoom stack, I'm going to have the mouse click with a modifier guide the new rect selection.
+
+I'm anticipating after getting the color to work that I'll need to have a Fractal interface that supports getPlot or
+something.
 */
 
 /* 	general structure is as before: we render screens tied to a rect
@@ -154,6 +157,11 @@ func (s *SceneStack) Top() *Scene {
 }
 func (s *SceneStack) Replace(newScene *Scene, programContext *ProgramContext) {
 	var replaced = s.Top()
+	if replaced == nil {
+		s.scenes = append(s.scenes, newScene)
+		newScene.resume(newScene, programContext)
+		return
+	}
 	replaced.pause(replaced, programContext)
 	var scenesLen = len(s.scenes)
 	s.scenes = s.scenes[:scenesLen-2]
@@ -225,10 +233,16 @@ type plotWidgetData struct {
 	cachedPlotValues *[]int16 // as a sanity check this should be [...].programSettings.
 }
 
+type GUIBaseWidgetData struct {
+	hidden        bool
+	cachedTexture *sdl.Texture
+}
+
 type ProgramContext struct {
 	window          *sdl.Window
 	renderer        *sdl.Renderer
 	programSettings *ProgramSettings
+	sceneStack      *SceneStack
 }
 type ProgramSettings struct {
 	ColorPalette            *ColorPalette
@@ -240,6 +254,7 @@ type ProgramSettings struct {
 	PlotResY                int32
 	MaxMandelbrotIterations int16
 	PreferredColorMethod    ColorMethod
+	UnitView                *sdl.FRect
 }
 
 func getInitProgramSettings() *ProgramSettings {
@@ -290,7 +305,9 @@ func getInitProgramSettings() *ProgramSettings {
 				ModuloPaletteEntry{&sdl.Color{106, 52, 3, 255}, 15},
 			},
 		},
+		// HACK: (?) is this (unitview and view having separate heap objects) wasteful? does it even matter?
 		PreferredColorMethod:    ColorMethodModulo,
+		UnitView:                &sdl.FRect{-2, -1.5, 4, 3},
 		View:                    &sdl.FRect{-2, -1.5, 4, 3},
 		WindowW:                 640,
 		WindowH:                 480,
@@ -369,6 +386,12 @@ func loadProgramSettings() (*ProgramSettings, error) {
 
 func validateProgramContext(p *ProgramContext) bool {
 	if p.window == nil || p.renderer == nil || p.programSettings == nil {
+		return false
+	}
+	if p.sceneStack == nil {
+		return false
+	}
+	if p.programSettings.View == nil || p.programSettings.UnitView == nil || p.programSettings.ColorPalette == nil {
 		return false
 	}
 	return true
@@ -583,6 +606,7 @@ func main() {
 			absolutePosition[0], absolutePosition[1], plotWidget.W, plotWidget.H})
 		p.renderer.Present()
 	}
+	// XXX: i'm pretty sure I have no way of marking a click event as handled here. this needs to be looked at later.
 	plotWidget.handleEvent = func(w *Widget, p *ProgramContext, i *inputStateType) {
 		// for now, just regen the plot without taking events into account
 		// i need to refactor this to have a dataIsReady() and dataIsSane()
@@ -593,6 +617,13 @@ func main() {
 		if len(*data.cachedPlotValues) != int(p.programSettings.PlotResX)*int(p.programSettings.PlotResY) {
 			panic("failed assert: len of cachedPlotValues does not match settings!")
 		}
+
+		if i.mouseButtons[mouseButtonLeft] {
+			var mouseX, mouseY, _ = sdl.GetMouseState()
+			var coord = convertPlotScreenCoordToPlotPlane([2]int32{mouseX, mouseY}, p)
+			changePlotView(p, 1, coord)
+		}
+
 		data.cachedPlotValues = regenPlotValues(p)
 		colorPlotWidgetTextureFromValues(w, p)
 		w.render(w, p)
@@ -633,6 +664,32 @@ func main() {
 		}
 	}
 
+	var GUIBaseWidget = Widget{
+		X: 0,
+		Y: 0,
+		W: rootWidget.W,
+		H: rootWidget.H,
+
+		parent:   &rootWidget,
+		children: []*Widget{},
+
+		data: GUIBaseWidgetData{},
+	}
+
+	GUIBaseWidget.render = func(w *Widget, p *ProgramContext) {
+		if !w.dataIsReady(w, p) {
+			panic("failed assert: data not ready when rendering GUIBaseWidget!")
+		}
+		var data = w.data.(*GUIBaseWidgetData)
+		if !data.hidden {
+			absolutePosition := getAbsolutePosition(w)
+			err = p.renderer.Copy(data.cachedTexture, &sdl.Rect{0, 0, w.W, w.H}, &sdl.Rect{absolutePosition[0], absolutePosition[1], w.W, w.H})
+			if err != nil {
+				panic(err)
+			}
+		}
+	}
+
 	var programContext = ProgramContext{
 		window:          window,
 		renderer:        renderer,
@@ -640,6 +697,13 @@ func main() {
 	}
 
 	rootWidget.initData(&rootWidget, &programContext)
+
+	var sceneStack = SceneStack{
+		scenes: []*Scene{},
+	}
+
+	// REVIEW: is this fine?
+	programContext.sceneStack = &sceneStack
 
 	if !validateWidgetAndChildren(&rootWidget) {
 		panic("failed assert: rootWidget failed to validate")
@@ -752,6 +816,9 @@ func main() {
 
 	// do the actual stuff we want to
 
+	sceneStack.Replace(&initScene, &programContext)
+
+	// ok because we know what the top scene is
 	initScene.handleEvent(&initScene, &programContext, &inputState)
 	initScene.render(&initScene, &programContext)
 
@@ -759,6 +826,8 @@ func main() {
 	for e := sdl.PollEvent(); true; e = sdl.PollEvent() {
 		if e != nil {
 			handleInputEvent(&inputState, e)
+			var topScene = sceneStack.Top()
+			topScene.handleEvent(topScene, &programContext, &inputState)
 		}
 	}
 }
@@ -964,4 +1033,16 @@ func chooseColorMethod(p *ProgramContext) ColorMethod {
 		return ColorMethodControlPoints
 	}
 	panic("error: no color method available!! ;-;")
+}
+
+// HACK: (?) scale and center are float32 here. can we squeeze some more resolution out of this?
+func changePlotView(p *ProgramContext, scale float32, center complex64) {
+	var newView = &sdl.FRect{
+		X: real(center) - (p.programSettings.UnitView.W*scale)/2,
+		Y: imag(center) - (p.programSettings.UnitView.H*scale)/2,
+		W: p.programSettings.UnitView.W * scale,
+		H: p.programSettings.UnitView.H * scale,
+	}
+	p.programSettings.View = newView
+	p.sceneStack.Top().update(p.sceneStack.Top(), p)
 }
