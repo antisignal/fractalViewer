@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"github.com/veandco/go-sdl2/sdl"
+	"log"
 	"math"
 	"os"
 	"runtime"
@@ -170,23 +171,28 @@ func (s *SceneStack) Replace(newScene *Scene, programContext *ProgramContext) {
 }
 
 type Scene struct {
-	update      func(*Scene, *ProgramContext)
-	render      func(*Scene, *ProgramContext)
-	handleEvent func(*Scene, *ProgramContext, *inputStateType)
-	destroy     func(*Scene)
-	pause       func(*Scene, *ProgramContext)
-	resume      func(*Scene, *ProgramContext)
+	update func(*Scene, *ProgramContext)
+	render func(*Scene, *ProgramContext)
+	// replaced with determineIntent/handleIntent
+	// handleEvent func(*Scene, *ProgramContext, *inputStateType)
+	destroy func(*Scene)
+	pause   func(*Scene, *ProgramContext)
+	resume  func(*Scene, *ProgramContext)
 
 	data interface{}
 
 	dataIsReady func(*Scene, *ProgramContext) bool
+
+	determineIntent func(*Scene, *ProgramContext) Intent
+	handleIntent    func(*Scene, *ProgramContext, Intent)
 }
 
-func validateScene(s *Scene) bool {
-	if s.update == nil || s.render == nil || s.handleEvent == nil || s.destroy == nil {
+// QUESTIONABLE: does not validate scene data!!
+func (s *Scene) validate() bool {
+	if s.update == nil || s.render == nil || s.destroy == nil {
 		return false
 	}
-	if s.pause == nil || s.resume == nil {
+	if s.pause == nil || s.resume == nil || s.determineIntent == nil || s.handleIntent == nil {
 		return false
 	}
 	return true
@@ -200,8 +206,12 @@ type Widget struct {
 	data     interface{}
 	initData func(*Widget, *ProgramContext)
 
-	render      func(*Widget, *ProgramContext)
-	handleEvent func(*Widget, *ProgramContext, *inputStateType)
+	update func(*Widget, *ProgramContext)
+	render func(*Widget, *ProgramContext)
+	// replaced with handleIntent (intent determined by containing Scene)
+	// handleEvent func(*Widget, *ProgramContext, *inputStateType)
+	handleIntent func(*Widget, *ProgramContext, Intent)
+
 	dataIsReady func(*Widget, *ProgramContext) bool
 	dataIsSane  func(*Widget, *ProgramContext) bool // HACK: is there a meaningful distinction to be made here?
 }
@@ -243,7 +253,10 @@ type ProgramContext struct {
 	renderer        *sdl.Renderer
 	programSettings *ProgramSettings
 	sceneStack      *SceneStack
+	inputHistory    *InputHistoryType
 }
+
+// HACK: should I be using reflect here to make sure the settings are valid?
 type ProgramSettings struct {
 	ColorPalette            *ColorPalette
 	View                    *sdl.FRect
@@ -257,7 +270,20 @@ type ProgramSettings struct {
 	UnitView                *sdl.FRect
 }
 
-func getInitProgramSettings() *ProgramSettings {
+// initialize shouldn't require any external anything to get an initialized copy
+type Initializable[T any] interface {
+	initialize() T
+}
+
+// for some things we can validate the instance with it alone,
+// for some things it needs to reflect the ProgramContext or some other outside information
+// so far, validation only requires itself
+type Validatable interface {
+	validate() bool
+}
+
+// what's the point of getting a pointer to it if i'm just gonna overwrite it?
+func (p *ProgramSettings) initialize() *ProgramSettings {
 	return &ProgramSettings{
 		// en.wikipedia.org/wiki/Color_gradient#/media/File:20180522_Color_palette_for_warming_stripes_-_ColorBrewer_9-class_single_hue.svg
 		/* ColorPalette: []*sdl.Color{
@@ -350,8 +376,8 @@ func saveProgramSettings(p *ProgramSettings) error {
 	return nil
 }
 
-func initSettingsFile() {
-	err := saveProgramSettings(getInitProgramSettings())
+func createDefaultSettingsFile() {
+	err := saveProgramSettings((&ProgramSettings{}).initialize())
 	if err != nil {
 		panic(err)
 	}
@@ -384,16 +410,30 @@ func loadProgramSettings() (*ProgramSettings, error) {
 	return loadedProgramSettings, nil
 }
 
-func validateProgramContext(p *ProgramContext) bool {
+func (p *ProgramContext) validate() bool {
 	if p.window == nil || p.renderer == nil || p.programSettings == nil {
 		return false
 	}
 	if p.sceneStack == nil {
 		return false
 	}
-	if p.programSettings.View == nil || p.programSettings.UnitView == nil || p.programSettings.ColorPalette == nil {
+	if p.inputHistory == nil {
 		return false
 	}
+	if !p.programSettings.validate() {
+		return false
+	}
+	/* if p.programSettings.View == nil || p.programSettings.UnitView == nil || p.programSettings.ColorPalette == nil {
+		return false
+	} */
+	return true
+}
+
+func (p *ProgramSettings) validate() bool {
+	if p.View == nil || p.UnitView == nil || p.ColorPalette == nil {
+		return false
+	}
+	// TODO: add more things here
 	return true
 }
 
@@ -415,15 +455,58 @@ const windowH = 480
 type inputStateType struct {
 	keys         [numKeys]bool
 	mouseButtons [numMouseButtons]bool
+	timestamp    uint64
 }
 
-func validateWidgetAndChildren(w *Widget) bool {
+// pass for now
+func (i *inputStateType) initialize() *inputStateType {
+	i.timestamp = math.MaxUint64
+	return i
+}
+
+// pass for now
+func (i *inputStateType) validate() bool {
+	if i.timestamp == 0 {
+		// log this probably shouldn't happen
+		log.Default().Println("WARNING: inputStateType variable has timestamp of 0. this hasn't been ruled out but is unexpected")
+	}
+	return true
+}
+
+// should this be a []iST or []*iST?
+type InputHistoryType struct {
+	inputs []*inputStateType
+}
+
+// pass for now
+func (i *InputHistoryType) initialize() *InputHistoryType {
+	return i
+}
+
+type Intent uint8 // for now, just uint8
+
+const (
+	IntentExit         = iota
+	IntentStart        = iota
+	IntentUnknown      = iota
+	IntentChangeCenter = iota
+	IntentZoom         = iota
+)
+
+func (w *Widget) validate() bool {
 	// conditions not yet known
-	if w.handleEvent == nil || w.render == nil {
+	// if dataIsSane == nil
+	if w == nil || w.render == nil || w.handleIntent == nil {
+		return false
+	}
+	if w.dataIsReady == nil {
+		return false
+	}
+	if w.update == nil {
 		return false
 	}
 	for _, child := range w.children {
-		if !validateWidgetAndChildren(child) {
+		if !child.validate() {
 			return false
 		}
 	}
@@ -462,10 +545,9 @@ func main() {
 
 		data: &rootWidgetData{},
 
-		parent:      nil,
-		children:    []*Widget{},
-		render:      nil,
-		handleEvent: nil,
+		parent:   nil,
+		children: []*Widget{},
+		render:   nil,
 		dataIsReady: func(w *Widget, p *ProgramContext) bool {
 			/* var wData, ok = w.data.(*rootWidgetData)
 			// panic here or just return false?
@@ -482,6 +564,7 @@ func main() {
 			}
 			return true
 		},
+		handleIntent: func(w *Widget, p *ProgramContext, i Intent) {},
 	}
 
 	rootWidget.render = func(w *Widget, p *ProgramContext) {
@@ -511,7 +594,7 @@ func main() {
 			child.render(child, p)
 		}
 	}
-	rootWidget.handleEvent = func(w *Widget, p *ProgramContext, state *inputStateType) {
+	rootWidget.handleIntent = func(w *Widget, p *ProgramContext, i Intent) {
 		// asserts are assumed to pass, but it's possible to change the dimensions of the texture at runtime and I don't like that.
 		// maybe there's a solution somewhere (7/2/25: should I have a dataSanityCheck function?)
 		// placeholder
@@ -551,8 +634,15 @@ func main() {
 		} else {
 			err = p.renderer.Copy(data.cachedTexture, &sdl.Rect{0, 0, w.W, w.H}, &sdl.Rect{w.X, w.Y, w.W, w.H})
 		} */
+		w.update(w, p)
 		for _, child := range w.children {
-			child.handleEvent(child, p, state)
+			child.handleIntent(child, p, i)
+		}
+	}
+
+	rootWidget.update = func(w *Widget, p *ProgramContext) {
+		for _, child := range w.children {
+			child.update(child, p)
 		}
 	}
 
@@ -607,26 +697,10 @@ func main() {
 		p.renderer.Present()
 	}
 	// XXX: i'm pretty sure I have no way of marking a click event as handled here. this needs to be looked at later.
-	plotWidget.handleEvent = func(w *Widget, p *ProgramContext, i *inputStateType) {
+	plotWidget.handleIntent = func(w *Widget, p *ProgramContext, i Intent) {
 		// for now, just regen the plot without taking events into account
 		// i need to refactor this to have a dataIsReady() and dataIsSane()
-		var data, ok = w.data.(*plotWidgetData)
-		if !ok {
-			panic("failed assert: type assertion failed on plotWidget data!")
-		}
-		if len(*data.cachedPlotValues) != int(p.programSettings.PlotResX)*int(p.programSettings.PlotResY) {
-			panic("failed assert: len of cachedPlotValues does not match settings!")
-		}
-
-		if i.mouseButtons[mouseButtonLeft] {
-			var mouseX, mouseY, _ = sdl.GetMouseState()
-			var coord = convertPlotScreenCoordToPlotPlane([2]int32{mouseX, mouseY}, p)
-			changePlotView(p, 1, coord)
-		}
-
-		data.cachedPlotValues = regenPlotValues(p)
-		colorPlotWidgetTextureFromValues(w, p)
-		w.render(w, p)
+		w.update(w, p)
 	}
 	// should I do dataIsReady and dataIsSane?
 	plotWidget.dataIsReady = func(w *Widget, p *ProgramContext) bool {
@@ -663,6 +737,27 @@ func main() {
 			data.cachedPlotValues = &blankPlotValues
 		}
 	}
+	plotWidget.update = func(w *Widget, p *ProgramContext) {
+		var data, ok = w.data.(*plotWidgetData)
+		if !ok {
+			panic("failed assert: type assertion failed on plotWidget data!")
+		}
+		if len(*data.cachedPlotValues) != int(p.programSettings.PlotResX)*int(p.programSettings.PlotResY) {
+			panic("failed assert: len of cachedPlotValues does not match settings!")
+		}
+
+		var currentInputState = p.inputHistory.top()
+
+		if currentInputState.mouseButtons[mouseButtonLeft] {
+			var mouseX, mouseY, _ = sdl.GetMouseState()
+			var coord = convertPlotScreenCoordToPlotPlane([2]int32{mouseX, mouseY}, p)
+			changePlotView(p, 1, coord)
+		}
+
+		data.cachedPlotValues = regenPlotValues(p)
+		colorPlotWidgetTextureFromValues(w, p)
+		w.render(w, p)
+	}
 
 	var GUIBaseWidget = Widget{
 		X: 0,
@@ -693,7 +788,7 @@ func main() {
 	var programContext = ProgramContext{
 		window:          window,
 		renderer:        renderer,
-		programSettings: getInitProgramSettings(),
+		programSettings: (&ProgramSettings{}).initialize(),
 	}
 
 	rootWidget.initData(&rootWidget, &programContext)
@@ -705,14 +800,15 @@ func main() {
 	// REVIEW: is this fine?
 	programContext.sceneStack = &sceneStack
 
-	if !validateWidgetAndChildren(&rootWidget) {
+	programContext.inputHistory = (&InputHistoryType{}).initialize()
+	programContext.inputHistory.pushFront((&inputStateType{}).initialize())
+
+	if !rootWidget.validate() {
 		panic("failed assert: rootWidget failed to validate")
 	}
-	if !validateProgramContext(&programContext) {
+	if !programContext.validate() {
 		panic("failed assert: program context did not validate")
 	}
-
-	var inputState inputStateType = inputStateType{}
 
 	// set up initScene
 	var initScene = Scene{}
@@ -738,15 +834,21 @@ func main() {
 	}
 
 	initScene.update = func(s *Scene, p *ProgramContext) {
-		// pass
+		var data, ok = s.data.(*initSceneData)
+		if !ok {
+			panic("failed assert: tried to update, but initScene data type assertion failed!")
+		}
+		for _, w := range data.widgets {
+			w.update(w, p)
+		}
 	}
 
-	initScene.handleEvent = func(s *Scene, p *ProgramContext, i *inputStateType) {
+	initScene.update = func(s *Scene, p *ProgramContext) {
 		if !s.dataIsReady(s, p) {
 			panic("failed assert: data not ready when initScene.update() called")
 		}
 		for _, w := range s.data.(*initSceneData).widgets {
-			w.handleEvent(w, &programContext, i)
+			w.update(w, &programContext)
 		}
 	}
 
@@ -761,8 +863,11 @@ func main() {
 	initScene.destroy = func(s *Scene) {
 		// let the GC handle it but make the program panic if it's used again (could be wasteful)
 		// there's still a chance the data can be accessed after the fact...
-		s.handleEvent = func(w *Scene, p *ProgramContext, state *inputStateType) {
-			panic("failed assert: scene method called after destroy called (handleEvent)")
+		s.handleIntent = func(w *Scene, p *ProgramContext, i Intent) {
+			panic("failed assert: scene method called after destroy called (handleIntent)")
+		}
+		s.determineIntent = func(w *Scene, p *ProgramContext) Intent {
+			panic("failed assert: scene method called after destroy called (determineIntent)")
 		}
 		s.render = func(s *Scene, p *ProgramContext) {
 			panic("failed assert: scene method called after destroy called (render)")
@@ -780,15 +885,37 @@ func main() {
 	}
 	initScene.pause = func(s *Scene, p *ProgramContext) {}
 	initScene.resume = func(s *Scene, p *ProgramContext) {}
+	initScene.determineIntent = func(s *Scene, p *ProgramContext) Intent {
+		if len(p.inputHistory.inputs) == 0 {
+			panic(
+				"failed assert: we should not have zero input events when trying to determine event! " +
+					"(init input should be present)")
+		}
+		if len(p.inputHistory.inputs) == 1 {
+			return IntentStart
+		}
+		return IntentUnknown
+	}
+	initScene.handleIntent = func(s *Scene, p *ProgramContext, i Intent) {
+		var data, ok = s.data.(*initSceneData)
+		if !ok {
+			panic("failed assert: trying to handle intent, but data is not of type initSceneData!")
+		}
+		if i == IntentStart {
+			for _, w := range data.widgets {
+				w.handleIntent(w, p, i)
+			}
+		}
+	}
 
-	if !validateScene(&initScene) {
+	if !initScene.validate() {
 		panic("failed assert: failed to validate initScene")
 	}
 
 	// load settings
 	programContext.programSettings, err = loadProgramSettings()
 	if err != nil {
-		programContext.programSettings = getInitProgramSettings()
+		programContext.programSettings = (&ProgramSettings{}).initialize()
 		// save later, now that it works
 		/*initSettingsFile()
 		programContext.programSettings, err = loadProgramSettings()
@@ -819,21 +946,71 @@ func main() {
 	sceneStack.Replace(&initScene, &programContext)
 
 	// ok because we know what the top scene is
-	initScene.handleEvent(&initScene, &programContext, &inputState)
+	var intent = initScene.determineIntent(&initScene, &programContext)
+	initScene.handleIntent(&initScene, &programContext, intent)
 	initScene.render(&initScene, &programContext)
 
 	// main event loop
 	for e := sdl.PollEvent(); true; e = sdl.PollEvent() {
-		if e != nil {
-			handleInputEvent(&inputState, e)
-			var topScene = sceneStack.Top()
-			topScene.handleEvent(topScene, &programContext, &inputState)
+		if e == nil {
+			continue
 		}
+
+		// QUESTIONABLE: should we have an exit input, which then translates into an exit Intent which is then acted on?
+		// i think a close intent is helpful maybe, that closes the active GUI widget/element/state broadly?
+		switch e.(type) {
+		case *sdl.QuitEvent:
+			sdl.Quit()
+			os.Exit(0)
+		}
+		if !sdlEventTypeIsInputType(e.GetType()) {
+			continue
+		}
+		var newInputState = (&inputStateType{}).initialize()
+		registerInputFromSDLEvent(newInputState, e)
+		if programContext.inputHistory.top() == newInputState {
+			continue
+		}
+		// guaranteed the new input is unique
+		programContext.inputHistory = programContext.inputHistory.pushFront(newInputState)
+		var topScene = sceneStack.Top()
+		// topScene.handleEvent(topScene, &programContext, &inputState)
+		var intent Intent = topScene.determineIntent(topScene, &programContext)
+		topScene.handleIntent(topScene, &programContext, intent)
 	}
 }
 
+func (i *InputHistoryType) top() *inputStateType {
+	return i.inputs[len(i.inputs)-1]
+}
+func (iH *InputHistoryType) pushFront(iS *inputStateType) *InputHistoryType {
+	iH.inputs = append(iH.inputs, iS)
+	return iH
+}
+
+func sdlEventTypeIsInputType(eventType uint32) bool {
+	// HACK: for now. i may want to change this later. this would guarantee that we only update the inputs when an input actually occurs
+	var inputTypes = [...]uint32{
+		sdl.MOUSEBUTTONDOWN,
+		sdl.MOUSEBUTTONUP,
+		sdl.KEYDOWN,
+		sdl.KEYUP,
+	}
+	// HACK?: generating this every time the function is called. shouldn't affect performance yet
+	for _, x := range inputTypes {
+		if eventType == x {
+			return true
+		}
+	}
+	return false
+}
+
 // is using the same values that SDL uses a problem?
-func handleInputEvent(inputState *inputStateType, e sdl.Event) {
+// we get an sdl.Event, we registerInputFromSDLEvent() which changes the inputState, then (in the main loop),
+// the top scene handles the event
+
+// maybe determineIntent() instead, then handleIntent()?
+func registerInputFromSDLEvent(inputState *inputStateType, e sdl.Event) {
 	switch e.(type) {
 	case *sdl.KeyboardEvent:
 		var ev = e.(*sdl.KeyboardEvent)
