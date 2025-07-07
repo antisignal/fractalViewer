@@ -453,9 +453,16 @@ const windowW = 640
 const windowH = 480
 
 type inputStateType struct {
-	keys         [numKeys]bool
-	mouseButtons [numMouseButtons]bool
+	keys         [numKeys]buttonState
+	mouseButtons [numMouseButtons]buttonState
+	mouseXY      [2]uint32
 	timestamp    uint64
+}
+
+type buttonState struct {
+	pressed  bool
+	held     bool
+	released bool
 }
 
 // pass for now
@@ -474,6 +481,7 @@ func (i *inputStateType) validate() bool {
 }
 
 // should this be a []iST or []*iST?
+// inputHistory needs entries to be immutable, but history itself to be changeable
 type InputHistoryType struct {
 	inputs []*inputStateType
 }
@@ -483,7 +491,64 @@ func (i *InputHistoryType) initialize() *InputHistoryType {
 	return i
 }
 
-type Intent uint8 // for now, just uint8
+// we have intents which contain a type and parameters, which are an interface
+
+type Intent struct {
+	intentType       uint8
+	intentParameters IntentParameters
+} // was a uint8
+
+func (i *Intent) validate() bool {
+	switch i.intentType {
+	case IntentChangeCenter:
+		params, ok := i.intentParameters.(*IntentParametersChangeCenter)
+		if !ok {
+			panic("failed assert: assertion of type intentParametersChangeCenter failed in intent validation!")
+		}
+		return params.validate()
+	case IntentZoom:
+		params, ok := i.intentParameters.(*IntentParametersZoom)
+		if !ok {
+			panic("failed assert: assertion of type intentParametersZoom failed in intent validation!")
+		}
+		return params.validate()
+	default:
+		panic("failed assert: trying to validate intent, but no case in validator for intentType!")
+	}
+}
+
+func (iP IntentParametersChangeCenter) validate() bool {
+	// maybe do stuff here later
+	return true
+}
+
+func (iP IntentParametersZoom) validate() bool {
+	// maybe do stuff here later
+	if iP.factor < 0 {
+		return false
+	}
+	return true
+}
+
+type IntentParameters interface {
+	Validatable
+}
+
+type IntentParametersChangeCenter struct {
+	newCenter complex64
+}
+type IntentParametersZoom struct {
+	factor float64
+}
+type IntentParametersStart struct{}
+type IntentParametersUnknown struct{}
+
+func (iP IntentParametersStart) validate() bool {
+	return true
+}
+func (iP IntentParametersUnknown) validate() bool {
+	return true
+}
 
 const (
 	IntentExit         = iota
@@ -700,6 +765,32 @@ func main() {
 	plotWidget.handleIntent = func(w *Widget, p *ProgramContext, i Intent) {
 		// for now, just regen the plot without taking events into account
 		// i need to refactor this to have a dataIsReady() and dataIsSane()
+		// this assumes that handleIntent() is called right after determineIntent() and
+		// before any further input is registered
+		switch i.intentType {
+		case IntentChangeCenter:
+			params, ok := i.intentParameters.(IntentParametersChangeCenter)
+			if !ok {
+				panic("failed assert: handling intent of apparent type IntentChangeCenter, but " +
+					"type assertion failed!")
+			}
+			// HACK: in doing this we don't verify the change propagated as a defensive measure before
+			// fixing next commit
+			// if p.programSettings.View.W != p.programSettings.UnitView.W *
+			// XXX: should this be handled by the widget or by the scene? i suspect the scene needs to handle it,
+			// then make the plotWidget update
+			// XXX: if I add lastScale and lastCenter to the programSettings,
+			// it denormalizes (?) the data held therein. but if I don't, then
+			// I can only reliably approximate it but not get an exact reconstruction because of fp math
+			// NOTE: this only works if the W/H ratio wrt the view of the plane stays consistent
+			var approxOldScale = p.programSettings.View.W / p.programSettings.UnitView.W
+			changePlotView(p, approxOldScale, params.newCenter)
+			w.update(w, p)
+		case IntentStart:
+			break
+		default:
+			panic("unhandled default case in plotWidget.handleIntent")
+		}
 		w.update(w, p)
 	}
 	// should I do dataIsReady and dataIsSane?
@@ -746,13 +837,13 @@ func main() {
 			panic("failed assert: len of cachedPlotValues does not match settings!")
 		}
 
-		var currentInputState = p.inputHistory.top()
-
+		// deprecated because we use Intents now
+		/* var currentInputState = p.inputHistory.top()
 		if currentInputState.mouseButtons[mouseButtonLeft] {
 			var mouseX, mouseY, _ = sdl.GetMouseState()
 			var coord = convertPlotScreenCoordToPlotPlane([2]int32{mouseX, mouseY}, p)
 			changePlotView(p, 1, coord)
-		}
+		} */
 
 		data.cachedPlotValues = regenPlotValues(p)
 		colorPlotWidgetTextureFromValues(w, p)
@@ -891,17 +982,31 @@ func main() {
 				"failed assert: we should not have zero input events when trying to determine event! " +
 					"(init input should be present)")
 		}
+		// should the length of the input history only ever be 1 if IntentStart is sent?
 		if len(p.inputHistory.inputs) == 1 {
-			return IntentStart
+			return Intent{IntentStart, IntentParametersStart{}}
 		}
-		return IntentUnknown
+		// for now, assume the user does not mean for the mouse click to be handled after previous ones are
+		var unhandledMouseClicks = getUnhandledMouseClicks(p.inputHistory)
+		if len(unhandledMouseClicks) == 0 {
+			return Intent{IntentUnknown, IntentParametersUnknown{}}
+		}
+		var lastUnhandledMouseClick = unhandledMouseClicks[len(unhandledMouseClicks)-1]
+		// HACK?: this conversion is from uint32 to int32 which is lossy
+		var newCenter = convertPlotScreenCoordToPlotPlane(lastUnhandledMouseClick.mouseXY, p)
+		return Intent{IntentChangeCenter, IntentParametersChangeCenter{
+			newCenter: newCenter,
+		}}
 	}
 	initScene.handleIntent = func(s *Scene, p *ProgramContext, i Intent) {
 		var data, ok = s.data.(*initSceneData)
 		if !ok {
 			panic("failed assert: trying to handle intent, but data is not of type initSceneData!")
 		}
-		if i == IntentStart {
+		// HACK: explicit enumeration of intentTypes to be handled by children.
+		// reminder: some of these need to be handled by the scene and not a widget, but they need to cause
+		// an update to be propagated down
+		if i.intentType == IntentStart || i.intentType == IntentChangeCenter || i.intentType == IntentZoom {
 			for _, w := range data.widgets {
 				w.handleIntent(w, p, i)
 			}
@@ -967,7 +1072,7 @@ func main() {
 			continue
 		}
 		var newInputState = (&inputStateType{}).initialize()
-		registerInputFromSDLEvent(newInputState, e)
+		registerInputFromSDLEvent(&programContext, newInputState, e)
 		if programContext.inputHistory.top() == newInputState {
 			continue
 		}
@@ -1010,33 +1115,123 @@ func sdlEventTypeIsInputType(eventType uint32) bool {
 // the top scene handles the event
 
 // maybe determineIntent() instead, then handleIntent()?
-func registerInputFromSDLEvent(inputState *inputStateType, e sdl.Event) {
+// MAJOR ASSUMPTION: the events are always processed and provided by SDL (!!) in the order they occur
+func registerInputFromSDLEvent(p *ProgramContext, inputState *inputStateType, e sdl.Event) {
+	// do basic setup
+	var lastInputState = p.inputHistory.top()
+	var nextInputStateIfUntouched = (&inputStateType{}).initialize()
+
 	switch e.(type) {
+	// my assumption is that each case will proceed until it finds a break
 	case *sdl.KeyboardEvent:
-		var ev = e.(*sdl.KeyboardEvent)
-		var state = false
-		if ev.State == sdl.PRESSED {
-			state = true
-		}
-		if ev.Keysym.Sym == sdl.K_m {
-			if ev.State == sdl.PRESSED {
-				inputState.keys[keyMenu] = state
+	case *sdl.MouseButtonEvent:
+
+		// all fields assumed to have the same sizes
+		for b, _ := range lastInputState.mouseButtons {
+			// XXX: check this
+			if lastInputState.mouseButtons[b].held && !lastInputState.mouseButtons[b].released {
+				(*nextInputStateIfUntouched).mouseButtons[b].held = true
+			} else {
+				(*nextInputStateIfUntouched).mouseButtons[b].held = false
 			}
 		}
-	case *sdl.MouseButtonEvent:
-		var ev = e.(*sdl.MouseButtonEvent)
-		var state = false
-		if ev.State == sdl.PRESSED {
-			state = true
+		for b, _ := range lastInputState.keys {
+			if lastInputState.keys[b].held && !lastInputState.keys[b].released {
+				(*nextInputStateIfUntouched).keys[b].held = true
+			} else {
+				(*nextInputStateIfUntouched).keys[b].held = false
+			}
 		}
+		break
+
+	default:
+		panic("failed assert: tried to register input from sdl event but" +
+			"input type was not accounted for by switch case!")
+	}
+
+	switch e.(type) {
+	case *sdl.KeyboardEvent:
+		// making a copy of the input state
+		var nextInputState = &*nextInputStateIfUntouched
+
+		// whichever button's state is updating: if it's pressed or released
+		var ev = e.(*sdl.KeyboardEvent)
+		var pressed bool
+		var released bool
+		if ev.State == sdl.PRESSED && ev.Repeat == 0 {
+			pressed = true
+		}
+		if ev.State == sdl.RELEASED && ev.Repeat == 0 {
+			released = false
+		}
+		// do nothing on repeat
+		switch ev.Keysym.Sym {
+		case sdl.K_m:
+			nextInputState.keys[keyMenu].pressed = pressed
+			nextInputState.keys[keyMenu].released = released
+		default:
+			log.Default().Println("NOTE: key pressed that will not be registered: sym " + string(ev.Keysym.Sym))
+		}
+		// HACK: doesn't account for overflow after ~49 days of continuous use
+		nextInputState.timestamp = uint64(ev.Timestamp)
+		*inputState = *nextInputState
+	case *sdl.MouseMotionEvent:
+		var ev = e.(*sdl.MouseMotionEvent)
+
+		var nextInputState = &*nextInputStateIfUntouched
+		nextInputState.mouseXY[0], nextInputState.mouseXY[1] = uint32(ev.X), uint32(ev.Y)
+		nextInputState.timestamp = uint64(ev.Timestamp)
+		*inputState = *nextInputState
+
+	case *sdl.MouseButtonEvent:
+		// we get a mouse button event and assume this is the only change.
+		// we then create a new input event based on the last one
+		// and change what needs to be changed based on the new input and the last state
+
+		var ev = e.(*sdl.MouseButtonEvent)
+
+		/* var newPressedState = false
+		if ev.State == sdl.PRESSED {
+			newPressedState = true
+		} */
+		var buttonChanged int = -1
 		switch ev.Button {
 		case sdl.BUTTON_LEFT:
-			inputState.mouseButtons[mouseButtonLeft] = state
+			buttonChanged = mouseButtonLeft
 		case sdl.BUTTON_RIGHT:
-			inputState.mouseButtons[mouseButtonRight] = state
+			buttonChanged = mouseButtonRight
 		case sdl.BUTTON_MIDDLE:
-			inputState.mouseButtons[mouseButtonMiddle] = state
+			buttonChanged = mouseButtonMiddle
+		default:
+			panic("failed assert: sdl event was MouseButtonEvent, but neither left/right/middle!")
 		}
+
+		var pressed bool
+		var heldPossible bool
+		var released bool
+		// XXX: this logic probably includes a bug somewhere. i would need to try it on paper
+		if ev.State == sdl.PRESSED && !nextInputStateIfUntouched.mouseButtons[buttonChanged].held {
+			pressed = true
+			heldPossible = false
+		}
+		if ev.State == sdl.RELEASED && nextInputStateIfUntouched.mouseButtons[buttonChanged].held {
+			released = true
+			heldPossible = false
+		}
+
+		var nextInputState = &*nextInputStateIfUntouched
+		if heldPossible == false {
+			nextInputState.mouseButtons[buttonChanged].held = false
+		}
+		nextInputState.mouseButtons[buttonChanged].pressed = pressed
+		nextInputState.mouseButtons[buttonChanged].released = released
+
+		// get mouse XY just for good measure
+		nextInputState.mouseXY[0] = uint32(ev.X)
+		nextInputState.mouseXY[1] = uint32(ev.Y)
+
+		nextInputState.timestamp = uint64(ev.Timestamp)
+		*inputState = *nextInputState
 	case *sdl.QuitEvent:
 		os.Exit(0)
 	}
@@ -1052,9 +1247,10 @@ func regenPlotValues(p *ProgramContext) *[]int16 {
 			panic("failed assert: more than MaxInt32 + 1 values in plot!")
 		}
 		// y coord
-		var quotient = int32(i) / p.programSettings.PlotResX
-		var remainder = int32(i) % p.programSettings.PlotResX
-		var currentPlotScreenCoord = [2]int32{remainder, quotient}
+		// HACK: lossy type cast from int32 to uint32 (there's no reason it should matter in a RL scenario)
+		var quotient = uint32(i) / uint32(p.programSettings.PlotResX)
+		var remainder = uint32(i) % uint32(p.programSettings.PlotResX)
+		var currentPlotScreenCoord = [2]uint32{remainder, quotient}
 		var currentPlotPlaneCoord = convertPlotScreenCoordToPlotPlane(currentPlotScreenCoord, p)
 		var currentPlotValue = calculatePlotValueFromPlaneCoord(currentPlotPlaneCoord, p)
 		out[i] = currentPlotValue
@@ -1064,7 +1260,7 @@ func regenPlotValues(p *ProgramContext) *[]int16 {
 
 // plotScreen coord is in the range 0-PlotResX, 0-PlotResY
 // plotPlane coord is in the range PlotRangeRealLower-PlotRangeRealUpper, 0-PlotRangeImagLower, PlotRangeImageUpper
-func convertPlotScreenCoordToPlotPlane(c [2]int32, p *ProgramContext) complex64 {
+func convertPlotScreenCoordToPlotPlane(c [2]uint32, p *ProgramContext) complex64 {
 	// HACK: using sdl.FRect as our storage for float values limits our resolution to what float32 can support
 	var screenCoordXProportionOfResX = float32(c[0]) / float32(p.programSettings.PlotResX)
 	var screenCoordYProportionOfResY = float32(c[1]) / float32(p.programSettings.PlotResY)
@@ -1214,12 +1410,32 @@ func chooseColorMethod(p *ProgramContext) ColorMethod {
 
 // HACK: (?) scale and center are float32 here. can we squeeze some more resolution out of this?
 func changePlotView(p *ProgramContext, scale float32, center complex64) {
-	var newView = &sdl.FRect{
+	var newView = getViewFromScaleAndCenter(p, scale, center)
+	p.programSettings.View = newView
+	p.sceneStack.Top().update(p.sceneStack.Top(), p)
+}
+
+func getViewFromScaleAndCenter(p *ProgramContext, scale float32, center complex64) *sdl.FRect {
+	return &sdl.FRect{
 		X: real(center) - (p.programSettings.UnitView.W*scale)/2,
 		Y: imag(center) - (p.programSettings.UnitView.H*scale)/2,
 		W: p.programSettings.UnitView.W * scale,
 		H: p.programSettings.UnitView.H * scale,
 	}
-	p.programSettings.View = newView
-	p.sceneStack.Top().update(p.sceneStack.Top(), p)
+}
+
+func getUnhandledMouseClicks(in *InputHistoryType) []*inputStateType {
+	// NOTE: when inputStates containing a mouse press are returned (i.e. mouse clicks), those clicks
+	// considered handled and no longer appear in the input history
+	var unhandledMouseClicks []*inputStateType
+	var inCopyWithoutMouseClicks InputHistoryType
+	for _, iS := range in.inputs {
+		if iS.mouseButtons[mouseButtonLeft].pressed {
+			unhandledMouseClicks = append(unhandledMouseClicks, iS)
+		} else {
+			inCopyWithoutMouseClicks.inputs = append(inCopyWithoutMouseClicks.inputs, iS)
+		}
+	}
+	*in = inCopyWithoutMouseClicks
+	return unhandledMouseClicks
 }
