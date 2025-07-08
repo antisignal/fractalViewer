@@ -57,6 +57,8 @@ something.
 // if the directory doesn't look like something this app created we'll just panic
 // i'm excited to get to work on GUI error dialogs
 
+// 7/7/25: handling Intent should start with the Scene, and if the Scene can't handle it or needs to propagate it down it does
+
 const SettingsPathWindows = "%USERPROFILE%\\AppData\\Local\\fractalViewer3\\"
 const SettingsPathNix = "$HOME/.fractalViewer3/"
 
@@ -144,7 +146,7 @@ func (s *SceneStack) Pop(programContext *ProgramContext) *Scene {
 	}
 	var popped = s.scenes[stackLen-1]
 	popped.pause(popped, programContext)
-	s.scenes = s.scenes[:stackLen-2] // check for off by one here
+	s.scenes = s.scenes[:stackLen-1] // NOTE: fixed off by one here
 	var newTop = s.Top()
 	newTop.resume(newTop, programContext)
 	return popped
@@ -439,6 +441,7 @@ func (p *ProgramSettings) validate() bool {
 
 const (
 	keyMenu = iota
+	keyZoom = iota
 	numKeys = iota
 )
 
@@ -451,6 +454,8 @@ const (
 
 const windowW = 640
 const windowH = 480
+
+const defaultZoomFactor = 0.5
 
 type inputStateType struct {
 	keys         [numKeys]buttonState
@@ -768,30 +773,12 @@ func main() {
 		// this assumes that handleIntent() is called right after determineIntent() and
 		// before any further input is registered
 		switch i.intentType {
-		case IntentChangeCenter:
-			params, ok := i.intentParameters.(IntentParametersChangeCenter)
-			if !ok {
-				panic("failed assert: handling intent of apparent type IntentChangeCenter, but " +
-					"type assertion failed!")
-			}
-			// HACK: in doing this we don't verify the change propagated as a defensive measure before
-			// fixing next commit
-			// if p.programSettings.View.W != p.programSettings.UnitView.W *
-			// XXX: should this be handled by the widget or by the scene? i suspect the scene needs to handle it,
-			// then make the plotWidget update
-			// XXX: if I add lastScale and lastCenter to the programSettings,
-			// it denormalizes (?) the data held therein. but if I don't, then
-			// I can only reliably approximate it but not get an exact reconstruction because of fp math
-			// NOTE: this only works if the W/H ratio wrt the view of the plane stays consistent
-			var approxOldScale = p.programSettings.View.W / p.programSettings.UnitView.W
-			changePlotView(p, approxOldScale, params.newCenter)
-			w.update(w, p)
 		case IntentStart:
-			break
+			w.update(w, p)
 		default:
 			panic("unhandled default case in plotWidget.handleIntent")
 		}
-		w.update(w, p)
+
 	}
 	// should I do dataIsReady and dataIsSane?
 	plotWidget.dataIsReady = func(w *Widget, p *ProgramContext) bool {
@@ -986,7 +973,16 @@ func main() {
 		if len(p.inputHistory.inputs) == 1 {
 			return Intent{IntentStart, IntentParametersStart{}}
 		}
-		// for now, assume the user does not mean for the mouse click to be handled after previous ones are
+		// for now, don't account for multiple button presses in rapid succession just yet
+		// NOTE: should this function be changed to get all presses of a certain type, with a parameter?
+		var unhandledButtonPresses []*inputStateType = getUnhandledButtonPresses(p.inputHistory)
+		if len(unhandledButtonPresses) != 0 {
+			var lastUnhandledButtonPress = unhandledButtonPresses[len(unhandledButtonPresses)-1]
+			if lastUnhandledButtonPress.keys[keyZoom].pressed {
+				return Intent{IntentZoom, IntentParametersZoom{defaultZoomFactor}}
+			}
+		}
+		// same here. assume the user does not mean for the mouse click to be handled after previous ones are
 		var unhandledMouseClicks = getUnhandledMouseClicks(p.inputHistory)
 		if len(unhandledMouseClicks) == 0 {
 			return Intent{IntentUnknown, IntentParametersUnknown{}}
@@ -1006,10 +1002,50 @@ func main() {
 		// HACK: explicit enumeration of intentTypes to be handled by children.
 		// reminder: some of these need to be handled by the scene and not a widget, but they need to cause
 		// an update to be propagated down
-		if i.intentType == IntentStart || i.intentType == IntentChangeCenter || i.intentType == IntentZoom {
+		switch i.intentType {
+		case IntentStart:
 			for _, w := range data.widgets {
 				w.handleIntent(w, p, i)
 			}
+		case IntentChangeCenter:
+			params, ok := i.intentParameters.(IntentParametersChangeCenter)
+			if !ok {
+				panic("failed assert: handling intent of apparent type IntentChangeCenter, but " +
+					"type assertion failed!")
+			}
+			// HACK: in doing this we don't verify the change propagated as a defensive measure before
+			// fixing next commit
+			// if p.programSettings.View.W != p.programSettings.UnitView.W *
+			// XXX: should this be handled by the widget or by the scene? i suspect the scene needs to handle it,
+			// then make the plotWidget update
+			// XXX: if I add lastScale and lastCenter to the programSettings,
+			// it denormalizes (?) the data held therein. but if I don't, then
+			// I can only reliably approximate it but not get an exact reconstruction because of fp math
+			// NOTE: this only works if the W/H ratio wrt the view of the plane stays consistent
+			var approxOldScale = p.programSettings.View.W / p.programSettings.UnitView.W
+			changePlotView(p, approxOldScale, params.newCenter)
+			for _, w := range data.widgets {
+				w.update(w, p)
+			}
+		case IntentZoom:
+			params, ok := i.intentParameters.(IntentParametersZoom)
+			if !ok {
+				panic("failed assert: handling intent of apparent type IntentZoom, but " +
+					"type assertion failed!")
+			}
+			// NOTE: this would be much cleaner and probably more reliable if I didn't have to
+			// approximate the parameters based on the existing view
+			var approxOldCenter complex64 = complex(
+				p.programSettings.View.X+(p.programSettings.View.W/2),
+				p.programSettings.View.Y+(p.programSettings.View.H/2))
+			var approxOldScale float32 = p.programSettings.View.W / p.programSettings.UnitView.W
+			// HACK: lossy conversion from float64 to float32
+			changePlotView(p, float32(params.factor)*approxOldScale, approxOldCenter)
+			for _, w := range data.widgets {
+				w.update(w, p)
+			}
+		default:
+
 		}
 	}
 
@@ -1169,6 +1205,9 @@ func registerInputFromSDLEvent(p *ProgramContext, inputState *inputStateType, e 
 		case sdl.K_m:
 			nextInputState.keys[keyMenu].pressed = pressed
 			nextInputState.keys[keyMenu].released = released
+		case sdl.K_z:
+			nextInputState.keys[keyZoom].pressed = pressed
+			nextInputState.keys[keyZoom].released = released
 		default:
 			log.Default().Println("NOTE: key pressed that will not be registered: sym " + string(ev.Keysym.Sym))
 		}
@@ -1438,4 +1477,18 @@ func getUnhandledMouseClicks(in *InputHistoryType) []*inputStateType {
 	}
 	*in = inCopyWithoutMouseClicks
 	return unhandledMouseClicks
+}
+
+func getUnhandledButtonPresses(in *InputHistoryType) []*inputStateType {
+	var unhandledButtonPresses []*inputStateType
+	var inCopyWithoutButtonPresses InputHistoryType
+	for _, iS := range in.inputs {
+		if iS.keys[keyZoom].pressed {
+			unhandledButtonPresses = append(unhandledButtonPresses, iS)
+		} else {
+			inCopyWithoutButtonPresses.inputs = append(inCopyWithoutButtonPresses.inputs, iS)
+		}
+	}
+	*in = inCopyWithoutButtonPresses
+	return unhandledButtonPresses
 }
