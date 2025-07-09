@@ -14,15 +14,15 @@ import (
 This will be the third iteration of the fractal viewer.
 
 I would like to include, from before:
-- gradient colors with 8 or 16 selections + black
-- a zoom and position stack
+- gradient colors with 8 or 16 selections + black (done)
+- a zoom and position stack (opted against)
 - a HUD with info
 -
 
 As well as:
-- parallel processing of the mandelbrot values (GPU?)
-- loading settings from a file (.yaml or .json?)
-  - custom color palette + initial bounds
+- parallel processing of the mandelbrot values (GPU?) (infeasible right now)
+- loading settings from a file (.yaml or .json?) (done)
+  - custom color palette + initial bounds (done)
 
 - keyboard controls (cycling HUD modes)
 - the HUD being multi-line, with an arbitrary amount of entries
@@ -58,6 +58,32 @@ something.
 // i'm excited to get to work on GUI error dialogs
 
 // 7/7/25: handling Intent should start with the Scene, and if the Scene can't handle it or needs to propagate it down it does
+
+// 7/9/25: there's a lot of dead code and dead comments here. this iteration needs to be wrapped up, then I need to
+// probably make a Kanban board for tasks related to the fractal viewer as well as a new requirements document
+
+// this prototype will be done when the following tasks are completed:
+// - basic GUI
+//   - display information like Minecraft's F3 (?) menu (toggleable) (must do)
+//     - display hover screenCoord, hover planeCoord, center planeCoord, zoom factor, value of pixel at cursor
+//     - display performance metrics (time to generate plot, average gen time, other stats)
+//     - display if floating point math is breaking down and suggest a switch to AP math at a performance cost (later)
+//       - do test every regen vs. AP math to see if FP math is breaking down?
+//   - controls display (toggleable)
+// - reset view button
+// - Fractal interface?
+//   - getName(), getDefaultView(), getValueAtPlaneCoord() or getValuesForScreenDimensions(), etc?
+//     - getValuesForScreenDimensions() takes the context, a rect, and an X/Y resolution and returns an array of pixels
+//   - getColorMethod() which itself is an interface:
+//     - colorPixel() (assumes independence of pixel colors)
+//     - is it worth it to have a set of genColorMethod[Method]() function returning a function to reduce duplication? or is this too much?
+//   - implement Julia fractal + others?
+//   - change fractal via GUI? (next iteration)
+
+// future ambitions:
+// - things listed at the top of this comment wall
+// - save screenshot (overkill?)
+// -
 
 const SettingsPathWindows = "%USERPROFILE%\\AppData\\Local\\fractalViewer3\\"
 const SettingsPathNix = "$HOME/.fractalViewer3/"
@@ -167,7 +193,7 @@ func (s *SceneStack) Replace(newScene *Scene, programContext *ProgramContext) {
 	}
 	replaced.pause(replaced, programContext)
 	var scenesLen = len(s.scenes)
-	s.scenes = s.scenes[:scenesLen-2]
+	s.scenes = s.scenes[:scenesLen-1] // check for off by one
 	s.scenes = append(s.scenes, newScene)
 	newScene.resume(newScene, programContext)
 }
@@ -911,6 +937,7 @@ func main() {
 		return false
 	}
 
+	// FIX: we set update() and then set it to something else
 	initScene.update = func(s *Scene, p *ProgramContext) {
 		var data, ok = s.data.(*initSceneData)
 		if !ok {
@@ -969,6 +996,8 @@ func main() {
 				"failed assert: we should not have zero input events when trying to determine event! " +
 					"(init input should be present)")
 		}
+		// HACK: what's the point of having it determine the Intent is IntentStart instead of just
+		// skipping determineIntent and having it handle a manually created IntentStart on the first pass?
 		// should the length of the input history only ever be 1 if IntentStart is sent?
 		if len(p.inputHistory.inputs) == 1 {
 			return Intent{IntentStart, IntentParametersStart{}}
@@ -1161,6 +1190,7 @@ func registerInputFromSDLEvent(p *ProgramContext, inputState *inputStateType, e 
 	// my assumption is that each case will proceed until it finds a break
 	case *sdl.KeyboardEvent:
 	case *sdl.MouseButtonEvent:
+	case *sdl.MouseMotionEvent:
 
 		// all fields assumed to have the same sizes
 		for b, _ := range lastInputState.mouseButtons {
@@ -1479,6 +1509,8 @@ func getUnhandledMouseClicks(in *InputHistoryType) []*inputStateType {
 	return unhandledMouseClicks
 }
 
+// so this just leaves the button holds in the event history while removing the
+// button presses? is that going to cause issues?
 func getUnhandledButtonPresses(in *InputHistoryType) []*inputStateType {
 	var unhandledButtonPresses []*inputStateType
 	var inCopyWithoutButtonPresses InputHistoryType
