@@ -1,0 +1,1 @@
+This repository is intended to act as a software engineering portfolio project. It will contain prototypes and a final version of a fractal viewer.
