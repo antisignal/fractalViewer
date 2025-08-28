@@ -260,8 +260,7 @@ type Widget struct {
 
 	update func(*Widget, *ProgramContext)
 	render func(*Widget, *ProgramContext)
-	// replaced with handleIntent (intent determined by containing Scene)
-	// handleEvent func(*Widget, *ProgramContext, *inputStateType)
+
 	handleIntent func(*Widget, *ProgramContext, Intent)
 
 	dataIsReady func(*Widget, *ProgramContext) bool
@@ -419,9 +418,16 @@ type InfoString struct {
 type InfoStringKind uint8
 
 // HACK: should I be using reflect here to make sure the settings are valid?
+
+type FRect struct {
+	X float64
+	Y float64
+	W float64
+	H float64
+}
 type ProgramSettings struct {
 	ColorPalette            *ColorPalette
-	View                    *sdl.FRect
+	View                    *FRect
 	WindowW                 int32
 	WindowH                 int32
 	TestRectangleColor      sdl.Color
@@ -429,7 +435,7 @@ type ProgramSettings struct {
 	PlotResY                int32
 	MaxMandelbrotIterations int16
 	PreferredColorMethod    ColorMethod
-	UnitView                *sdl.FRect
+	UnitView                *FRect
 	StyleSheet              *StyleSheet
 	DefaultFontSize         int
 	DefaultFontLocation     string
@@ -451,31 +457,6 @@ type Validatable interface {
 func (p *ProgramSettings) initialize() *ProgramSettings {
 	return &ProgramSettings{
 		// en.wikipedia.org/wiki/Color_gradient#/media/File:20180522_Color_palette_for_warming_stripes_-_ColorBrewer_9-class_single_hue.svg
-		/* ColorPalette: []*sdl.Color{
-			{33, 113, 181, 255},  // color -6, range 0-127
-			{107, 174, 214, 255}, // color -4, range 128-255
-			{198, 219, 239, 255}, // color -2
-			{255, 255, 255, 255}, // color 0
-			{252, 187, 161, 255}, // color +2
-			{251, 106, 74, 255},  // color +4
-			{203, 24, 29, 255},   // color +6
-			{103, 0, 13, 255},    // color +8
-		}, */
-		// https://stackoverflow.com/questions/16500656/which-color-gradient-is-used-to-color-mandelbrot-in-wikipedia
-		/* ColorPalette: &ColorPalette{
-		&ControlPointsColorPalette{
-			ControlPointsPaletteEntry{
-				color:        &sdl.Color{0, 7, 100, 255},
-				controlPoint: 0.0,
-			},
-			ControlPointsPaletteEntry{
-				color:        &sdl.Color{32, 107, 203, 255},
-				controlPoint: 0.16,
-			},
-			ControlPointsPaletteEntry{
-				color: &sdl.Color{237,255,255},
-			},
-		}, [...] */
 		ColorPalette: &ColorPalette{
 			controlPointsColorPalette: nil,
 			moduloColorPalette: &ModuloColorPalette{
@@ -498,8 +479,8 @@ func (p *ProgramSettings) initialize() *ProgramSettings {
 		},
 		// HACK: (?) is this (unitview and view having separate heap objects) wasteful? does it even matter?
 		PreferredColorMethod:    ColorMethodModulo,
-		UnitView:                &sdl.FRect{-2, -1.5, 4, 3},
-		View:                    &sdl.FRect{-2, -1.5, 4, 3},
+		UnitView:                &FRect{-2, -1.5, 4, 3},
+		View:                    &FRect{-2, -1.5, 4, 3},
 		WindowW:                 640,
 		WindowH:                 480,
 		TestRectangleColor:      sdl.Color{0, 0, 255, 255},
@@ -789,7 +770,7 @@ type IntentParameters interface {
 }
 
 type IntentParametersChangeCenter struct {
-	newCenter complex64
+	newCenter complex128
 }
 type IntentParametersZoom struct {
 	factor float64
@@ -1036,7 +1017,7 @@ func getFreshPlotWidget(rootWidget *Widget) *Widget {
 		err = p.renderer.Copy(tex, &sdl.Rect{
 			0, 0, plotWidget.W, plotWidget.H}, &sdl.Rect{
 			absolutePosition[0], absolutePosition[1], plotWidget.W, plotWidget.H})
-		p.renderer.Present()
+		// p.renderer.Present()
 	}
 	// XXX: i'm pretty sure I have no way of marking a click event as handled here. this needs to be looked at later.
 	plotWidget.handleIntent = func(w *Widget, p *ProgramContext, i Intent) {
@@ -1418,12 +1399,12 @@ func getFreshInitScene(rootWidget *Widget) *Scene {
 			}
 			// NOTE: this would be much cleaner and probably more reliable if I didn't have to
 			// approximate the parameters based on the existing view
-			var approxOldCenter complex64 = complex(
+			var approxOldCenter complex128 = complex128(complex(
 				p.programSettings.View.X+(p.programSettings.View.W/2),
-				p.programSettings.View.Y+(p.programSettings.View.H/2))
-			var approxOldScale float32 = p.programSettings.View.W / p.programSettings.UnitView.W
+				p.programSettings.View.Y+(p.programSettings.View.H/2)))
+			var approxOldScale float64 = p.programSettings.View.W / p.programSettings.UnitView.W
 			// HACK: lossy conversion from float64 to float32
-			changePlotView(p, float32(params.factor)*approxOldScale, approxOldCenter)
+			changePlotView(p, float64(params.factor)*approxOldScale, approxOldCenter)
 			p.regenInfoText()
 			for _, w := range data.widgets {
 				w.update(w, p)
@@ -1438,7 +1419,7 @@ func getFreshInitScene(rootWidget *Widget) *Scene {
 			var approxUnitCenter = complex(
 				p.programSettings.UnitView.X+(p.programSettings.UnitView.W/2),
 				p.programSettings.UnitView.Y+(p.programSettings.UnitView.H/2))
-			var unitScale float32 = 1.0
+			var unitScale float64 = 1.0
 			changePlotView(p, unitScale, approxUnitCenter)
 			p.regenInfoText()
 			for _, w := range data.widgets {
@@ -1915,6 +1896,7 @@ func main() {
 
 	// ok because we know what the top scene is
 	// var intent = initScene.determineIntent(&initScene, &programContext) // no reason to do this
+	plotWidget.update(&plotWidget, &programContext)
 	initScene.handleIntent(&initScene, &programContext, Intent{IntentStart, IntentParametersStart{}})
 	initScene.render(&initScene, &programContext)
 
@@ -2158,7 +2140,7 @@ func regenPlotValues(p *ProgramContext) *[]int16 {
 
 func (p *ProgramContext) regenInfoText() {
 	p.programInfoCache.infoStrings = [numInfoStringKinds]InfoString{}
-	var hoverCoordString = "current hover coord: (" +
+	var hoverCoordString = "current hover coord on screen: (" +
 		strconv.Itoa(int(p.programInfoCache.lastKnownHoverCoord[0])) +
 		", " + strconv.Itoa(int(p.programInfoCache.lastKnownHoverCoord[1])) + ")"
 	p.programInfoCache.infoStrings[infoStringKindHoverScreenCoord] = InfoString{
@@ -2168,25 +2150,28 @@ func (p *ProgramContext) regenInfoText() {
 	p.programInfoCache.infoStrings[infoStringKindHoverPlaneCoord] = InfoString{
 		infoStringKindHoverPlaneCoord,
 		"current hover coord in complex plane: " +
-			fmt.Sprintf("(%.6f, %.6f)", real(convertPlotScreenCoordToPlotPlane(p.programInfoCache.lastKnownHoverCoord, p)),
+			fmt.Sprintf("(%.12f, %.12f)", real(convertPlotScreenCoordToPlotPlane(p.programInfoCache.lastKnownHoverCoord, p)),
 				imag(convertPlotScreenCoordToPlotPlane(p.programInfoCache.lastKnownHoverCoord, p))),
 	}
 }
 
 // plotScreen coord is in the range 0-PlotResX, 0-PlotResY
 // plotPlane coord is in the range PlotRangeRealLower-PlotRangeRealUpper, 0-PlotRangeImagLower, PlotRangeImageUpper
-func convertPlotScreenCoordToPlotPlane(c [2]uint32, p *ProgramContext) complex64 {
+func convertPlotScreenCoordToPlotPlane(c [2]uint32, p *ProgramContext) complex128 {
 	// HACK: using sdl.FRect as our storage for float values limits our resolution to what float32 can support
-	var screenCoordXProportionOfResX = float32(c[0]) / float32(p.programSettings.PlotResX)
-	var screenCoordYProportionOfResY = float32(c[1]) / float32(p.programSettings.PlotResY)
+	var screenCoordXProportionOfResX = float64(c[0]) / float64(p.programSettings.PlotResX)
+	var screenCoordYProportionOfResY = float64(c[1]) / float64(p.programSettings.PlotResY)
 	var planeCoordRealShift = screenCoordXProportionOfResX * p.programSettings.View.W
 	var planeCoordImagShift = screenCoordYProportionOfResY * p.programSettings.View.H
 	var planeCoordRealAbsolutePosition = p.programSettings.View.X + planeCoordRealShift
 	var planeCoordImagAbsolutePosition = p.programSettings.View.Y + planeCoordImagShift
-	return complex(planeCoordRealAbsolutePosition, planeCoordImagAbsolutePosition)
+	return complex(
+		planeCoordRealAbsolutePosition,
+		planeCoordImagAbsolutePosition,
+	)
 }
 
-func calculatePlotValueFromPlaneCoord(c complex64, p *ProgramContext) int16 {
+func calculatePlotValueFromPlaneCoord(c complex128, p *ProgramContext) int16 {
 	// HACK: eventually we should replace this with a function that works for multiple fractals and continuous complex
 	// functions
 	// same as prototype 2
@@ -2324,14 +2309,14 @@ func chooseColorMethod(p *ProgramContext) ColorMethod {
 }
 
 // HACK: (?) scale and center are float32 here. can we squeeze some more resolution out of this?
-func changePlotView(p *ProgramContext, scale float32, center complex64) {
+func changePlotView(p *ProgramContext, scale float64, center complex128) {
 	var newView = getViewFromScaleAndCenter(p, scale, center)
 	p.programSettings.View = newView
 	p.sceneStack.Top().update(p.sceneStack.Top(), p)
 }
 
-func getViewFromScaleAndCenter(p *ProgramContext, scale float32, center complex64) *sdl.FRect {
-	return &sdl.FRect{
+func getViewFromScaleAndCenter(p *ProgramContext, scale float64, center complex128) *FRect {
+	return &FRect{
 		X: real(center) - (p.programSettings.UnitView.W*scale)/2,
 		Y: imag(center) - (p.programSettings.UnitView.H*scale)/2,
 		W: p.programSettings.UnitView.W * scale,
