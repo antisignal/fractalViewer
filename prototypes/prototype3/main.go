@@ -2,12 +2,19 @@ package main
 
 import (
 	"encoding/json"
-	"github.com/veandco/go-sdl2/sdl"
+	"fmt"
 	"log"
 	"math"
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
+
+	"github.com/veandco/go-sdl2/sdl"
+	"github.com/veandco/go-sdl2/ttf"
+
+	"runtime/pprof"
+	"sync"
 )
 
 /*
@@ -80,10 +87,20 @@ something.
 //   - implement Julia fractal + others?
 //   - change fractal via GUI? (next iteration)
 
+// 08-29-25: this code needs the following revisions:
+// - finish adding features
+// - handle errors instead of panicking
+// - clean up dead code and comments
+// - fix HACK/XXX sections
+// - strengthen validation
+// - document once the prototype is complete
+// - add unit tests
+
 // future ambitions:
 // - things listed at the top of this comment wall
 // - save screenshot (overkill?)
-// -
+
+// TODO: inconsistent exporting because I'm capitalizing the names of variables haphazardly at the moment
 
 const SettingsPathWindows = "%USERPROFILE%\\AppData\\Local\\fractalViewer3\\"
 const SettingsPathNix = "$HOME/.fractalViewer3/"
@@ -161,7 +178,9 @@ type SceneStack struct {
 
 func (s *SceneStack) Push(scene *Scene, programContext *ProgramContext) {
 	var top = s.Top()
-	top.pause(top, programContext)
+	if top != nil {
+		top.pause(top, programContext)
+	}
 	scene.resume(scene, programContext)
 	s.scenes = append(s.scenes, scene)
 }
@@ -174,7 +193,9 @@ func (s *SceneStack) Pop(programContext *ProgramContext) *Scene {
 	popped.pause(popped, programContext)
 	s.scenes = s.scenes[:stackLen-1] // NOTE: fixed off by one here
 	var newTop = s.Top()
-	newTop.resume(newTop, programContext)
+	if newTop != nil {
+		newTop.resume(newTop, programContext)
+	}
 	return popped
 }
 func (s *SceneStack) Top() *Scene {
@@ -213,6 +234,8 @@ type Scene struct {
 
 	determineIntent func(*Scene, *ProgramContext) Intent
 	handleIntent    func(*Scene, *ProgramContext, Intent)
+
+	// scenes should validateWidgetTree (?)
 }
 
 // QUESTIONABLE: does not validate scene data!!
@@ -227,9 +250,10 @@ func (s *Scene) validate() bool {
 }
 
 type Widget struct {
-	X, Y, W, H int32
-	parent     *Widget
-	children   []*Widget
+	X, Y, W, H       int32
+	kind             uint16
+	parent           *Widget
+	optionalChildren []*Widget
 
 	data     interface{}
 	initData func(*Widget, *ProgramContext)
@@ -244,8 +268,8 @@ type Widget struct {
 	dataIsSane  func(*Widget, *ProgramContext) bool // HACK: is there a meaningful distinction to be made here?
 }
 
-func (w *Widget) registerChildWidget(child *Widget) {
-	w.children = append(w.children, child)
+func (w *Widget) registerOptionalChildWidget(child *Widget) {
+	w.optionalChildren = append(w.optionalChildren, child)
 	child.parent = w
 }
 
@@ -276,13 +300,123 @@ type GUIBaseWidgetData struct {
 	cachedTexture *sdl.Texture
 }
 
-type ProgramContext struct {
-	window          *sdl.Window
-	renderer        *sdl.Renderer
-	programSettings *ProgramSettings
-	sceneStack      *SceneStack
-	inputHistory    *InputHistoryType
+type GUIInfoTextListWidgetData struct {
 }
+
+// XXX: does baking the style into the widget defeat the purpose of my other design decisions? as in,
+// should style be passed upon generating the widget while the widget itself remains agnostic to it?
+// response: I'm moving forward with it left out
+type GUIInfoTextWidgetData struct {
+	correspondingInfoString InfoStringKind
+	mandatoryChildren       GUIInfoTextWidgetMandatoryChildren
+}
+
+type GUITextWidgetData struct {
+	text    string
+	texture *sdl.Texture
+}
+
+type GUIInfoTextWidgetMandatoryChildren struct {
+	textWidget  *Widget
+	plateWidget *Widget
+}
+
+type GUIInfoTextListWidgetStyle struct {
+	paddingBetweenEntries int
+}
+
+// TODO: should padding be pixels or proportion of the screen? or a hybrid method?
+type GUIInfoTextWidgetStyle struct {
+	innerPadding styleInfoInnerPadding
+}
+
+type GUIPlateWidgetStyle struct {
+	innerPadding styleInfoInnerPadding
+	plateColor   *sdl.Color
+}
+
+type GUITextWidgetStyle struct {
+	font      *ttf.Font
+	textColor *sdl.Color
+}
+
+type GUIPalette []sdl.Color
+
+type styleInfoInnerPadding struct {
+	paddingPixels     [4]uint32
+	paddingProportion [4]float64
+}
+
+// must be populated for every type of widget
+// TODO: have a const declaration with every type of widget, then have each widget instance have a field
+// widgetType that stores the type of widget, so I can index into an array of widget styles?
+// maybe also have a function which createsWidgetFromTypeWithoutChildren() or something which references
+// the style array?
+// this sounds like an iteration 4 thing
+type StyleSheet struct {
+	rootWidgetStyle            *rootWidgetStyle
+	plotWidgetStyle            *plotWidgetStyle
+	guiBaseWidgetStyle         *GUIBaseWidgetStyle
+	guiInfoTextListWidgetStyle *GUIInfoTextListWidgetStyle
+	guiInfoTextWidgetStyle     *GUIInfoTextWidgetStyle
+	guiTextWidgetStyle         *GUITextWidgetStyle
+	guiPlateWidgetStyle        *GUIPlateWidgetStyle
+}
+
+func (s *StyleSheet) initialize() *StyleSheet {
+	s.rootWidgetStyle = &rootWidgetStyle{}
+	s.plotWidgetStyle = &plotWidgetStyle{}
+	s.guiBaseWidgetStyle = &GUIBaseWidgetStyle{}
+	s.guiInfoTextListWidgetStyle = &GUIInfoTextListWidgetStyle{
+		paddingBetweenEntries: 5,
+	}
+	s.guiInfoTextWidgetStyle = &GUIInfoTextWidgetStyle{
+		innerPadding: styleInfoInnerPadding{
+			paddingPixels:     [4]uint32{5, 5, 5, 5},
+			paddingProportion: [4]float64{0., 0., 0., 0.},
+		},
+	}
+	// this requires ttf to be init and a font to be available. it needs to be set in the main loop
+	s.guiTextWidgetStyle = &GUITextWidgetStyle{
+		textColor: &sdl.Color{R: 255, G: 255, A: 255},
+		font:      nil,
+	}
+	s.guiPlateWidgetStyle = &GUIPlateWidgetStyle{
+		plateColor: &sdl.Color{G: 255, B: 255, A: 255},
+		innerPadding: styleInfoInnerPadding{
+			paddingPixels:     [4]uint32{5, 5, 5, 5},
+			paddingProportion: [4]float64{0, 0, 0, 0},
+		},
+	}
+	return s
+}
+
+type rootWidgetStyle struct{}
+type plotWidgetStyle struct{}
+type GUIBaseWidgetStyle struct{}
+
+// TODO: should the StyleSheet be part of the programSettings? (yes!)
+type ProgramContext struct {
+	window           *sdl.Window
+	renderer         *sdl.Renderer
+	programSettings  *ProgramSettings
+	sceneStack       *SceneStack
+	inputHistory     *InputHistoryType
+	programInfoCache *ProgramInfoCache
+}
+
+type ProgramInfoCache struct {
+	infoStrings         [numInfoStringKinds]InfoString
+	timesToGeneratePlot []uint64
+	lastKnownHoverCoord [2]uint32
+}
+
+type InfoString struct {
+	infoStringKind InfoStringKind
+	string         string
+}
+
+type InfoStringKind uint8
 
 // HACK: should I be using reflect here to make sure the settings are valid?
 type ProgramSettings struct {
@@ -296,6 +430,9 @@ type ProgramSettings struct {
 	MaxMandelbrotIterations int16
 	PreferredColorMethod    ColorMethod
 	UnitView                *sdl.FRect
+	StyleSheet              *StyleSheet
+	DefaultFontSize         int
+	DefaultFontLocation     string
 }
 
 // initialize shouldn't require any external anything to get an initialized copy
@@ -369,6 +506,24 @@ func (p *ProgramSettings) initialize() *ProgramSettings {
 		PlotResX:                640,
 		PlotResY:                480,
 		MaxMandelbrotIterations: 1024,
+		DefaultFontLocation:     "../prototype2/m5x7.ttf",
+		DefaultFontSize:         16,
+		StyleSheet: &StyleSheet{
+			rootWidgetStyle:            &rootWidgetStyle{},
+			plotWidgetStyle:            &plotWidgetStyle{},
+			guiBaseWidgetStyle:         &GUIBaseWidgetStyle{},
+			guiInfoTextListWidgetStyle: &GUIInfoTextListWidgetStyle{},
+			guiInfoTextWidgetStyle:     &GUIInfoTextWidgetStyle{},
+			guiTextWidgetStyle: &GUITextWidgetStyle{
+				textColor: &sdl.Color{255, 255, 255, 255},
+			},
+			guiPlateWidgetStyle: &GUIPlateWidgetStyle{
+				innerPadding: styleInfoInnerPadding{
+					paddingPixels: [4]uint32{5, 5, 5, 5},
+				},
+				plateColor: &sdl.Color{0, 0, 0, 255},
+			},
+		},
 	}
 }
 
@@ -448,6 +603,9 @@ func (p *ProgramContext) validate() bool {
 	if p.inputHistory == nil {
 		return false
 	}
+	if p.programInfoCache == nil {
+		return false
+	}
 	if !p.programSettings.validate() {
 		return false
 	}
@@ -462,13 +620,40 @@ func (p *ProgramSettings) validate() bool {
 		return false
 	}
 	// TODO: add more things here
+	if p.DefaultFontLocation == "" || p.DefaultFontSize == 0 {
+		return false
+	}
+	if p.StyleSheet == nil {
+		return false
+	}
+	if !p.StyleSheet.validate() {
+		return false
+	}
+	return true
+}
+
+func (s *StyleSheet) validate() bool {
+	if s.rootWidgetStyle == nil || s.plotWidgetStyle == nil || s.guiInfoTextWidgetStyle == nil {
+		return false
+	}
+	if s.guiInfoTextListWidgetStyle == nil || s.guiBaseWidgetStyle == nil {
+		return false
+	}
+	if s.guiPlateWidgetStyle == nil || s.guiTextWidgetStyle == nil {
+		return false
+	}
+
+	if s.guiTextWidgetStyle.font == nil {
+		return false
+	}
 	return true
 }
 
 const (
-	keyMenu = iota
-	keyZoom = iota
-	numKeys = iota
+	keyMenu      = iota
+	keyZoom      = iota
+	keyResetView = iota
+	numKeys      = iota
 )
 
 const (
@@ -483,6 +668,40 @@ const windowH = 480
 
 const defaultZoomFactor = 0.5
 
+const (
+	GUIPaletteLightColor  = iota
+	GUIPaletteDarkColor   = iota
+	GUIPaletteAccentColor = iota
+	numGUIPaletteItems    = iota
+)
+
+// check: does this fragment anything, or add redundancy in an unhelpful way?
+const (
+	rootWidgetKind            = iota
+	plotWidgetKind            = iota
+	guiBaseWidgetKind         = iota
+	guiInfoTextListWidgetKind = iota
+	guiInfoTextWidgetKind     = iota
+	guiPlateWidgetKind        = iota
+	guiTextWidgetKind         = iota
+	numWidgetKinds            = iota
+)
+
+const (
+	infoStringKindHoverScreenCoord           = iota
+	infoStringKindHoverPlaneCoord            = iota
+	infoStringKindInstantaneousTimeToDisplay = iota
+	infoStringKindAverageTimeToDisplay       = iota
+	numInfoStringKinds                       = iota
+)
+
+const (
+	paddingLeft   = iota
+	paddingTop    = iota
+	paddingRight  = iota
+	paddingBottom = iota
+)
+
 type inputStateType struct {
 	keys         [numKeys]buttonState
 	mouseButtons [numMouseButtons]buttonState
@@ -494,6 +713,10 @@ type buttonState struct {
 	pressed  bool
 	held     bool
 	released bool
+}
+
+func (data *GUIInfoTextListWidgetData) validate() bool {
+	return true
 }
 
 // pass for now
@@ -571,8 +794,13 @@ type IntentParametersChangeCenter struct {
 type IntentParametersZoom struct {
 	factor float64
 }
+type IntentParametersMoveMouse struct {
+	targetScreenCoord [2]uint32
+}
+type IntentParametersResetView struct{}
 type IntentParametersStart struct{}
 type IntentParametersUnknown struct{}
+type IntentParametersToggleGUIInfoTextList struct{}
 
 func (iP IntentParametersStart) validate() bool {
 	return true
@@ -580,13 +808,20 @@ func (iP IntentParametersStart) validate() bool {
 func (iP IntentParametersUnknown) validate() bool {
 	return true
 }
+func (iP IntentParametersResetView) validate() bool             { return true }
+func (iP IntentParametersMoveMouse) validate() bool             { return true }
+func (iP IntentParametersToggleGUIInfoTextList) validate() bool { return true }
 
 const (
-	IntentExit         = iota
-	IntentStart        = iota
-	IntentUnknown      = iota
-	IntentChangeCenter = iota
-	IntentZoom         = iota
+	IntentExit                  = iota
+	IntentStart                 = iota
+	IntentUnknown               = iota
+	IntentChangeCenter          = iota
+	IntentZoom                  = iota
+	IntentResetView             = iota
+	IntentMoveMouse             = iota
+	IntentToggleGUIInfoTextList = iota
+	numIntents                  = iota
 )
 
 func (w *Widget) validate() bool {
@@ -601,7 +836,7 @@ func (w *Widget) validate() bool {
 	if w.update == nil {
 		return false
 	}
-	for _, child := range w.children {
+	for _, child := range w.optionalChildren {
 		if !child.validate() {
 			return false
 		}
@@ -613,27 +848,8 @@ type initSceneData struct {
 	widgets []*Widget
 }
 
-func main() {
-	// the OpenCL route i intended to go down is ineffective due to the (apparent) inadequacy of existing Go OpenCL
-	// bindings. so instead I'm going to use either GLSL or a CPU/multi-goroutine based method
-
-	// later, I will implement maybe two methods for calculating Mandelbrot plots: n-bit precision (using GLSL?) and
-	// arbitrary precision (using a library, and calculating plot subsets in a multi-goroutine way)
-
-	// for now:
-
-	err := sdl.Init(sdl.INIT_EVERYTHING)
-	if err != nil {
-		panic(err)
-	}
-	defer sdl.Quit()
-	window, renderer, err := sdl.CreateWindowAndRenderer(windowW, windowH, sdl.WINDOW_SHOWN)
-	if err != nil {
-		panic(err)
-	}
-	window.SetTitle("fractal viewer prototype 3!!! :DDD")
-	// setup rootWidget
-	var rootWidget = Widget{
+func getFreshRootWidget() *Widget {
+	var rootWidget = &Widget{
 		X: 0,
 		Y: 0,
 		W: windowW,
@@ -641,9 +857,9 @@ func main() {
 
 		data: &rootWidgetData{},
 
-		parent:   nil,
-		children: []*Widget{},
-		render:   nil,
+		parent:           nil,
+		optionalChildren: []*Widget{},
+		render:           nil,
 		dataIsReady: func(w *Widget, p *ProgramContext) bool {
 			/* var wData, ok = w.data.(*rootWidgetData)
 			// panic here or just return false?
@@ -653,7 +869,7 @@ func main() {
 			if wData.cachedTexture == nil {
 				return false
 			} */
-			for _, child := range w.children {
+			for _, child := range w.optionalChildren {
 				if !child.dataIsReady(child, p) {
 					return false
 				}
@@ -686,7 +902,7 @@ func main() {
 			panic("renderer failed to copy texture in rootWidget render: " + err.Error())
 		}
 		p.renderer.Present() */
-		for _, child := range w.children {
+		for _, child := range w.optionalChildren {
 			child.render(child, p)
 		}
 	}
@@ -730,36 +946,66 @@ func main() {
 		} else {
 			err = p.renderer.Copy(data.cachedTexture, &sdl.Rect{0, 0, w.W, w.H}, &sdl.Rect{w.X, w.Y, w.W, w.H})
 		} */
-		w.update(w, p)
-		for _, child := range w.children {
-			child.handleIntent(child, p, i)
+
+		// w.update(w, p) // commented out as an experiment on 2025-08-28
+		switch i.intentType {
+		case IntentMoveMouse:
+			for _, child := range w.optionalChildren {
+				if child.kind == guiBaseWidgetKind {
+					child.handleIntent(child, p, i)
+				}
+			}
+			return
+		}
+		for _, child := range w.optionalChildren {
+			if child.kind == guiBaseWidgetKind {
+				child.handleIntent(child, p, i)
+			}
 		}
 	}
 
 	rootWidget.update = func(w *Widget, p *ProgramContext) {
-		for _, child := range w.children {
+		for _, child := range w.optionalChildren {
 			child.update(child, p)
 		}
 	}
+	rootWidget.initData = func(w *Widget, p *ProgramContext) {
+		for _, child := range w.optionalChildren {
+			child.initData(child, p)
+		}
+	}
+	rootWidget.kind = rootWidgetKind
+	return rootWidget
+}
 
-	var plotWidget = Widget{
-		// all coords of parent children are specified relative to parent. not implementing disown/adopt feature
+// TODO: we should be able to have a plot widget attach to a parentWidget that isn't a rootWidget
+func getFreshPlotWidget(rootWidget *Widget) *Widget {
+
+	// if we're sloppy this might not even guarantee that it's a root widget for sure, but it helps
+	if rootWidget.kind != rootWidgetKind {
+		panic("failed assert: widget passed as rootWidget to getFreshPlotWidget() not of kind rootWidgetKind")
+	}
+	// double checking out of paranoia ;)
+	_, ok := rootWidget.data.(*rootWidgetData)
+	if !ok {
+		panic("failed assert: even though the rootWidget passed to getFreshPlotWidget() is supposedly of kind" +
+			"rootWidgetKind, its data doesn't pass the type assertion!!")
+	}
+
+	var plotWidget = &Widget{
+		// all coords of parent optionalChildren are specified relative to parent. not implementing disown/adopt feature
 		X: 0,
 		Y: 0,
 		W: rootWidget.W,
 		H: rootWidget.H,
 
-		parent:   &rootWidget,
-		children: []*Widget{},
+		parent:           rootWidget,
+		optionalChildren: []*Widget{},
+
+		kind: plotWidgetKind,
 
 		data: &plotWidgetData{},
 	}
-	rootWidget.initData = func(w *Widget, p *ProgramContext) {
-		for _, child := range w.children {
-			child.initData(child, p)
-		}
-	}
-	rootWidget.registerChildWidget(&plotWidget)
 	plotWidget.render = func(w *Widget, p *ProgramContext) {
 		// where we'll do the main mandelbrot plot rendering (from cache)
 
@@ -831,6 +1077,7 @@ func main() {
 			panic("failed assert: data not plotWidgetData in plotWidget.initData()")
 		}
 		if data.cachedTexture == nil {
+			var err error
 			data.cachedTexture, err = p.renderer.CreateTexture(sdl.PIXELFORMAT_RGBA8888, sdl.TEXTUREACCESS_TARGET, p.programSettings.PlotResX, p.programSettings.PlotResY)
 			if err != nil {
 				panic(err)
@@ -860,19 +1107,22 @@ func main() {
 
 		data.cachedPlotValues = regenPlotValues(p)
 		colorPlotWidgetTextureFromValues(w, p)
-		w.render(w, p)
+		// w.render(w, p) COMMENTED AS A TEST
 	}
+	return plotWidget
+}
 
-	var GUIBaseWidget = Widget{
+func getFreshGUIBaseWidget(rootWidget *Widget) *Widget {
+	var GUIBaseWidget = &Widget{
 		X: 0,
 		Y: 0,
 		W: rootWidget.W,
 		H: rootWidget.H,
 
-		parent:   &rootWidget,
-		children: []*Widget{},
+		parent:           rootWidget,
+		optionalChildren: []*Widget{},
 
-		data: GUIBaseWidgetData{},
+		data: &GUIBaseWidgetData{},
 	}
 
 	GUIBaseWidget.render = func(w *Widget, p *ProgramContext) {
@@ -881,44 +1131,131 @@ func main() {
 		}
 		var data = w.data.(*GUIBaseWidgetData)
 		if !data.hidden {
-			absolutePosition := getAbsolutePosition(w)
-			err = p.renderer.Copy(data.cachedTexture, &sdl.Rect{0, 0, w.W, w.H}, &sdl.Rect{absolutePosition[0], absolutePosition[1], w.W, w.H})
-			if err != nil {
-				panic(err)
+			for _, c := range w.optionalChildren {
+				c.render(c, p)
 			}
 		}
 	}
 
-	var programContext = ProgramContext{
-		window:          window,
-		renderer:        renderer,
-		programSettings: (&ProgramSettings{}).initialize(),
+	GUIBaseWidget.update = func(w *Widget, p *ProgramContext) {
+		for _, c := range w.optionalChildren {
+			c.update(c, p)
+		}
+	}
+	GUIBaseWidget.handleIntent = func(w *Widget, p *ProgramContext, i Intent) {
+		switch i.intentType {
+		case IntentMoveMouse:
+			for _, c := range w.optionalChildren {
+				if c.kind != plotWidgetKind {
+					c.update(c, p)
+				}
+			}
+		case IntentStart:
+			return
+		default:
+			panic("unhandled default case in GUIBaseWidget.handleIntent")
+		}
+	}
+	GUIBaseWidget.initData = func(w *Widget, p *ProgramContext) {
+	}
+	GUIBaseWidget.dataIsReady = func(w *Widget, p *ProgramContext) bool {
+		/* var data, ok = w.data.(*GUIBaseWidgetData)
+		if !ok {
+			panic("failed assert: type assert in GUIBaseWidget.dataIsReady failed (on data!)")
+		}
+		if data.cachedTexture == nil {
+			return false
+		} */
+		return true
+	}
+	GUIBaseWidget.dataIsSane = func(w *Widget, p *ProgramContext) bool { return true }
+	GUIBaseWidget.kind = guiBaseWidgetKind
+	return GUIBaseWidget
+}
+
+func getFreshGUIInfoTextListWIdget(guiBaseWidget *Widget) *Widget {
+	var freshGUIInfoTextListWidget = &Widget{
+		X: guiBaseWidget.X,
+		Y: guiBaseWidget.Y,
+		W: guiBaseWidget.W,
+		H: guiBaseWidget.H,
+	}
+	freshGUIInfoTextListWidget.update = func(w *Widget, p *ProgramContext) {
+		// when we update, we get each of the infoStrings
+		// => generate the text
+		// => generate the plate (based on text rect + parameters for inner padding on the plate)
+		// => position the plate and text relative to widget (based on inner padding of the plate + inner padding of the widget
+		// => render the widget (which just renders the plate, then the text -
+		// each of their rendering functions is just copying their cached texture (from their data field) to
+		// their absolute position
+
+		// my other thought process: destroy all the children (diabolical), regen the text, regen the plate,
+		// set the offsets, determine position of self relative to base widget, render the plate at its absolute position,
+		// render the text at its absolute position,
+
+		// doing this without a regen might be more complex?
+
+		// this is unnecessary because I forgot the infotextwidgets are stored as optional children
+		var data, ok = w.data.(*GUIInfoTextListWidgetData)
+		if !ok {
+			panic("failed assert: type assertion failed on data in freshGUIInfoTextListWidget.update()!")
+		}
+		if !data.validate() {
+			panic("failed assert: data in freshGUIInfoTextListWidget.update() failed to validate!")
+		}
+
+		for i, c := range w.optionalChildren {
+			// this should include a flag for the corresponding infoString
+			var childData = c.data.(*GUIInfoTextWidgetData)
+			// this should generate a texture based on the corresponding infoString
+			childData.mandatoryChildren.textWidget.update(w, p)
+			// then we generate the plate - we assume (is this good practice?) that we're part of a GUIInfoTextWidget
+			// and get the text widget via the parent
+			childData.mandatoryChildren.plateWidget.update(w, p) // this should also update the size of the plate widget
+			// now we set the positions of each based on the StyleSheet
+			// TODO: make this also take paddingProportion into account
+			// XXX: conversion from uint32 to int32 (should not matter, but needs review later)
+
+			// XXX: check this
+			childData.mandatoryChildren.plateWidget.X = w.W -
+				(int32(p.programSettings.StyleSheet.guiInfoTextWidgetStyle.innerPadding.paddingPixels[paddingLeft]) +
+					(int32(p.programSettings.StyleSheet.guiInfoTextWidgetStyle.innerPadding.paddingPixels[paddingRight]) +
+						childData.mandatoryChildren.plateWidget.W))
+			childData.mandatoryChildren.plateWidget.Y = 0 +
+				((int32(p.programSettings.StyleSheet.guiInfoTextWidgetStyle.innerPadding.paddingPixels[paddingTop]) +
+					(int32(p.programSettings.StyleSheet.guiInfoTextWidgetStyle.innerPadding.paddingPixels[paddingBottom]) +
+						childData.mandatoryChildren.plateWidget.H)) * int32(i)) +
+				int32(p.programSettings.StyleSheet.guiInfoTextWidgetStyle.innerPadding.paddingPixels[paddingTop])
+			childData.mandatoryChildren.textWidget.X = childData.mandatoryChildren.plateWidget.X +
+				int32(p.programSettings.StyleSheet.guiPlateWidgetStyle.innerPadding.paddingPixels[paddingLeft])
+			childData.mandatoryChildren.textWidget.Y = childData.mandatoryChildren.plateWidget.Y +
+				int32(p.programSettings.StyleSheet.guiPlateWidgetStyle.innerPadding.paddingPixels[paddingTop])
+		}
+
+		/* freshGUIInfoTextListWidget.optionalChildren = []*Widget{}
+		for i, x := range p.programInfoCache.infoStrings {
+			var newGUIInfoTextWidget = &Widget{
+				kind: guiInfoTextListWidgetKind,
+			}
+			if !newGUIInfoTextWidget.validate() {
+				panic("failed assert: newGUIInfoTextWidget in GUIBaseWidget.update() failed to validate!")
+			}
+			w.optionalChildren = append(w.optionalChildren, newGUIInfoTextWidget)
+		} */
 	}
 
-	rootWidget.initData(&rootWidget, &programContext)
+	freshGUIInfoTextListWidget.render = func(w *Widget, p *ProgramContext) {
+		// we need a z buffer in the next iteration
 
-	var sceneStack = SceneStack{
-		scenes: []*Scene{},
 	}
+	return freshGUIInfoTextListWidget
+}
 
-	// REVIEW: is this fine?
-	programContext.sceneStack = &sceneStack
-
-	programContext.inputHistory = (&InputHistoryType{}).initialize()
-	programContext.inputHistory.pushFront((&inputStateType{}).initialize())
-
-	if !rootWidget.validate() {
-		panic("failed assert: rootWidget failed to validate")
-	}
-	if !programContext.validate() {
-		panic("failed assert: program context did not validate")
-	}
-
-	// set up initScene
-	var initScene = Scene{}
+func getFreshInitScene(rootWidget *Widget) *Scene {
+	var initScene = &Scene{}
 
 	initScene.data = &initSceneData{
-		widgets: []*Widget{&rootWidget},
+		widgets: []*Widget{rootWidget},
 	}
 
 	initScene.dataIsReady = func(s *Scene, p *ProgramContext) bool {
@@ -953,7 +1290,7 @@ func main() {
 			panic("failed assert: data not ready when initScene.update() called")
 		}
 		for _, w := range s.data.(*initSceneData).widgets {
-			w.update(w, &programContext)
+			w.update(w, p)
 		}
 	}
 
@@ -964,6 +1301,7 @@ func main() {
 		for _, w := range s.data.(*initSceneData).widgets {
 			w.render(w, p)
 		}
+		p.renderer.Present()
 	}
 	initScene.destroy = func(s *Scene) {
 		// let the GC handle it but make the program panic if it's used again (could be wasteful)
@@ -1004,11 +1342,25 @@ func main() {
 		}
 		// for now, don't account for multiple button presses in rapid succession just yet
 		// NOTE: should this function be changed to get all presses of a certain type, with a parameter?
+		var lastKnownMousePos = p.inputHistory.top().mouseXY
+		if lastKnownMousePos != p.programInfoCache.lastKnownHoverCoord {
+			p.programInfoCache.lastKnownHoverCoord = lastKnownMousePos
+			return Intent{IntentMoveMouse, IntentParametersMoveMouse{
+				targetScreenCoord: lastKnownMousePos,
+			}}
+		}
+
 		var unhandledButtonPresses []*inputStateType = getUnhandledButtonPresses(p.inputHistory)
 		if len(unhandledButtonPresses) != 0 {
 			var lastUnhandledButtonPress = unhandledButtonPresses[len(unhandledButtonPresses)-1]
 			if lastUnhandledButtonPress.keys[keyZoom].pressed {
 				return Intent{IntentZoom, IntentParametersZoom{defaultZoomFactor}}
+			}
+			if lastUnhandledButtonPress.keys[keyResetView].pressed {
+				return Intent{IntentResetView, IntentParametersResetView{}}
+			}
+			if lastUnhandledButtonPress.keys[keyMenu].pressed {
+				return Intent{IntentToggleGUIInfoTextList, IntentParametersToggleGUIInfoTextList{}}
 			}
 		}
 		// same here. assume the user does not mean for the mouse click to be handled after previous ones are
@@ -1028,11 +1380,12 @@ func main() {
 		if !ok {
 			panic("failed assert: trying to handle intent, but data is not of type initSceneData!")
 		}
-		// HACK: explicit enumeration of intentTypes to be handled by children.
+		// HACK: explicit enumeration of intentTypes to be handled by optionalChildren.
 		// reminder: some of these need to be handled by the scene and not a widget, but they need to cause
 		// an update to be propagated down
 		switch i.intentType {
 		case IntentStart:
+			p.regenInfoText()
 			for _, w := range data.widgets {
 				w.handleIntent(w, p, i)
 			}
@@ -1053,6 +1406,7 @@ func main() {
 			// NOTE: this only works if the W/H ratio wrt the view of the plane stays consistent
 			var approxOldScale = p.programSettings.View.W / p.programSettings.UnitView.W
 			changePlotView(p, approxOldScale, params.newCenter)
+			p.regenInfoText()
 			for _, w := range data.widgets {
 				w.update(w, p)
 			}
@@ -1070,6 +1424,78 @@ func main() {
 			var approxOldScale float32 = p.programSettings.View.W / p.programSettings.UnitView.W
 			// HACK: lossy conversion from float64 to float32
 			changePlotView(p, float32(params.factor)*approxOldScale, approxOldCenter)
+			p.regenInfoText()
+			for _, w := range data.widgets {
+				w.update(w, p)
+			}
+		// FIX: is this redundant?
+		case IntentResetView:
+			_, ok := i.intentParameters.(IntentParametersResetView)
+			if !ok {
+				panic("failed assert: handling intent of apparent type IntentResetView, but type assertion failed!")
+			}
+			// known scale and center; it's derived from the unitview
+			var approxUnitCenter = complex(
+				p.programSettings.UnitView.X+(p.programSettings.UnitView.W/2),
+				p.programSettings.UnitView.Y+(p.programSettings.UnitView.H/2))
+			var unitScale float32 = 1.0
+			changePlotView(p, unitScale, approxUnitCenter)
+			p.regenInfoText()
+			for _, w := range data.widgets {
+				w.update(w, p)
+			}
+		case IntentMoveMouse:
+			params, ok := i.intentParameters.(IntentParametersMoveMouse)
+			if !ok {
+				panic("failed assert: type assertion on params of supposed type IntentParametersMoveMouse failed!")
+			}
+			p.programInfoCache.lastKnownHoverCoord = params.targetScreenCoord
+			p.regenInfoText()
+			for _, w := range data.widgets {
+				// CHECK: is this an okay architectural decision, to not update everything here?
+				if w.kind == rootWidgetKind {
+					w.handleIntent(w, p, i)
+				}
+			}
+		case IntentToggleGUIInfoTextList:
+			_, ok := i.intentParameters.(IntentParametersToggleGUIInfoTextList)
+			if !ok {
+				panic("failed assert: type assertion of params of supposed type IntentToggleGUIInfoTextList failed!")
+			}
+			data, ok = s.data.(*initSceneData)
+			if !ok {
+				panic("failed assert: type assertion of initSceneData in initScene.handleIntent failed!")
+			}
+			// find the GUIInfoTextListWidget and make it invisible or remove it (probably remove it)
+			var initSceneRootWidget *Widget
+			for _, w := range data.widgets {
+				if w.kind == rootWidgetKind {
+					initSceneRootWidget = w
+				}
+			}
+			if initSceneRootWidget == nil {
+				panic("failed assert: initScene has no root widget!")
+			}
+
+			var initSceneGUIBaseWidget *Widget
+			for _, c := range initSceneRootWidget.optionalChildren {
+				if c.kind == guiBaseWidgetKind {
+					initSceneGUIBaseWidget = c
+				}
+			}
+			if initSceneGUIBaseWidget == nil {
+				panic("failed assert: initScene has no GUIBaseWidget!")
+			}
+			var initSceneGUIInfoTextListWidget *Widget
+			for i, c := range initSceneGUIBaseWidget.optionalChildren {
+				if c.kind == guiInfoTextListWidgetKind {
+					initSceneGUIInfoTextListWidget = c
+					initSceneGUIBaseWidget.optionalChildren = append(initSceneGUIBaseWidget.optionalChildren[:i], initSceneGUIBaseWidget.optionalChildren[i+1:]...)
+				}
+			}
+			if initSceneGUIInfoTextListWidget == nil {
+				getFreshGUIInfoTextListWIdget(initSceneGUIBaseWidget)
+			}
 			for _, w := range data.widgets {
 				w.update(w, p)
 			}
@@ -1077,22 +1503,394 @@ func main() {
 
 		}
 	}
+	return initScene
+}
+
+type GUIPlateWidgetData struct {
+	texture *sdl.Texture
+}
+
+func main() {
+	// the OpenCL route i intended to go down is ineffective due to the (apparent) inadequacy of existing Go OpenCL
+	// bindings. so instead I'm going to use either GLSL or a CPU/multi-goroutine based method
+
+	// later, I will implement maybe two methods for calculating Mandelbrot plots: n-bit precision (using GLSL?) and
+	// arbitrary precision (using a library, and calculating plot subsets in a multi-goroutine way)
+
+	// for now:
+
+	err := sdl.Init(sdl.INIT_EVERYTHING)
+	if err != nil {
+		panic(err)
+	}
+	defer sdl.Quit()
+	window, renderer, err := sdl.CreateWindowAndRenderer(windowW, windowH, sdl.WINDOW_SHOWN)
+	if err != nil {
+		panic(err)
+	}
+	window.SetTitle("fractal viewer prototype 3!!! :DDD")
+	// setup rootWidget
+
+	var rootWidget = *getFreshRootWidget()
+	var plotWidget = *getFreshPlotWidget(&rootWidget)
+	rootWidget.registerOptionalChildWidget(&plotWidget)
+
+	var guiBaseWidget = *getFreshGUIBaseWidget(&rootWidget)
+	rootWidget.registerOptionalChildWidget(&guiBaseWidget)
+
+	// var guiInfoTextListWidget = *getFreshGUIInfoTextListWidget()
+
+	// difference from what I originally intended: this widget is the same as the screen size
+	var guiInfoTextListWidget = Widget{
+		X: 0,
+		Y: 0,
+		W: guiBaseWidget.W,
+		H: guiBaseWidget.H,
+
+		kind: guiInfoTextListWidgetKind,
+
+		parent:           &guiBaseWidget,
+		optionalChildren: []*Widget{},
+
+		data: GUIInfoTextListWidgetData{},
+
+		initData:     nil,
+		update:       nil,
+		render:       nil,
+		handleIntent: nil,
+		dataIsReady:  nil,
+		dataIsSane:   nil,
+	}
+
+	// this seems to have no purpose at the moment given I can initialize the data in the getFresh[...]() function.
+	// can this be repurposed to be a "reInitData" or something else helpful?
+	guiInfoTextListWidget.initData = func(w *Widget, p *ProgramContext) {
+		w.data = GUIInfoTextListWidgetData{}
+	}
+
+	guiInfoTextListWidget.dataIsSane = func(w *Widget, p *ProgramContext) bool {
+		// what is this supposed to be doing again?
+		return w.dataIsReady(w, p)
+	}
+
+	guiInfoTextListWidget.dataIsReady = func(w *Widget, p *ProgramContext) bool {
+		data, ok := w.data.(*GUIInfoTextListWidgetData)
+		// XXX: this never returns false. i think I'm deviating from my own plan here
+		if !ok {
+			panic("failed assert: type assertion failed on data of guiInfoTextListWidget, of supposed type GUIInfoTextListWidgetData!")
+		}
+		if !data.validate() {
+			panic("failed assert: data of widget performing initData (guiInfoTextListWidget) failed to validate!")
+		}
+		return true
+	}
+
+	guiInfoTextListWidget.update = func(w *Widget, p *ProgramContext) {
+		// every time we update, we need to update the textures stored in data
+		// => when we add said textures to the data, the validator function/dataIsReady/dataIsSane needs to
+		//    be updated
+
+		// regen textures from data (should that be a function that every widget has, if it has associated textures?
+		// i'm gonna go with that's included in the scope of update() and then we can just call render() for the
+		// rendering
+		if w.kind != guiInfoTextListWidgetKind {
+			panic("failed assert: kind of guiInfoTextListWidget is not guiInfoTextListWidgetKind!")
+		}
+		/* var data, ok = w.data.(*GUIInfoTextListWidgetData)
+		if !ok {
+			panic("failed assert: type assertion failed in guiInfoTextListWidget.update(), " +
+				"with supposed type *GUIInfoTextListWidgetData!")
+		} */
+		// regenerate the children based on the available infoStrings
+		w.optionalChildren = []*Widget{}
+		for i, iS := range p.programInfoCache.infoStrings {
+			var freshInfoTextWidgetFromIS = &Widget{
+				// leaving dimensions undefined
+				Y: func() int32 {
+					var padding int32
+					if i != 0 {
+						padding = int32(p.programSettings.StyleSheet.guiInfoTextListWidgetStyle.paddingBetweenEntries * (i - 1))
+					}
+					return int32((p.programSettings.StyleSheet.guiTextWidgetStyle.font.Height() * i)) + padding
+				}(),
+
+				kind:   guiInfoTextWidgetKind,
+				parent: w,
+
+				// must add the children afterwards
+				data: &GUIInfoTextWidgetData{
+					correspondingInfoString: iS.infoStringKind,
+					mandatoryChildren: GUIInfoTextWidgetMandatoryChildren{
+						textWidget:  nil,
+						plateWidget: nil,
+					},
+				},
+
+				optionalChildren: []*Widget{},
+
+				initData:     nil,
+				update:       nil,
+				render:       nil,
+				handleIntent: nil,
+				dataIsReady:  nil,
+				dataIsSane:   nil,
+			}
+
+			freshInfoTextWidgetFromIS.initData = func(w *Widget, p *ProgramContext) {
+				var data, ok = w.data.(*GUIInfoTextWidgetData)
+				if !ok {
+					panic("failed assert: tried to init data in freshInfoTextWidgetFromIS, " +
+						"but type assertion of data failed!")
+				}
+				data.mandatoryChildren.plateWidget = getFreshPlateWidget(w)
+				data.mandatoryChildren.textWidget = getFreshTextWidget(w)
+			}
+			freshInfoTextWidgetFromIS.update = func(w *Widget, p *ProgramContext) {
+				var data, ok = w.data.(*GUIInfoTextWidgetData)
+				if !ok {
+					panic("failed assert: tried to update data in freshInfoTextWidgetFromIS, " +
+						"but type assertion of data failed!")
+				}
+				textWidgetData, ok := data.mandatoryChildren.textWidget.data.(*GUITextWidgetData)
+				if !ok {
+					panic("failed assert: type assert failed on freshInfoText[...] textWidget child data!")
+				}
+				// NOTE: there's probably some useless redundancy here that can be fixed in the next iteration
+				textWidgetData.text = p.programInfoCache.infoStrings[InfoStringKind(i)].string
+				if len(textWidgetData.text) == 0 {
+					return
+				}
+				textSurface, err := p.programSettings.StyleSheet.
+					guiTextWidgetStyle.font.RenderUTF8Solid(textWidgetData.text,
+					*p.programSettings.StyleSheet.guiTextWidgetStyle.textColor)
+				if err != nil {
+					panic("failed to generate textSurface: " + err.Error())
+				}
+				textWidgetData.texture, err = p.renderer.CreateTextureFromSurface(textSurface)
+				if err != nil {
+					panic("failed to generate textTexture: " + err.Error())
+				}
+				_, _, textWidgetTextureW, textWidgetTextureH, err := textWidgetData.texture.Query()
+				if err != nil {
+					panic("failed to query textTexture: " + err.Error())
+				}
+				// then update the plateWidget based on the textWidget
+				plateWidgetData, ok := data.mandatoryChildren.plateWidget.data.(*GUIPlateWidgetData)
+				if !ok {
+					panic("failed assert: type assert failed for supposed GUIPlateWidgetData in freshInfoText[...].update()")
+				}
+				plateWidgetData.texture, err = p.renderer.CreateTexture(sdl.PIXELFORMAT_RGBA8888, sdl.TEXTUREACCESS_TARGET,
+					int32(p.programSettings.StyleSheet.guiPlateWidgetStyle.innerPadding.paddingPixels[paddingLeft]+
+						p.programSettings.StyleSheet.guiPlateWidgetStyle.innerPadding.paddingPixels[paddingRight])+
+						textWidgetTextureW,
+					int32(p.programSettings.StyleSheet.guiPlateWidgetStyle.innerPadding.paddingPixels[paddingTop]+
+						p.programSettings.StyleSheet.guiPlateWidgetStyle.innerPadding.paddingPixels[paddingBottom])+
+						textWidgetTextureH,
+				)
+				if err != nil {
+					panic("failed to create texture: " + err.Error())
+				}
+				err = p.renderer.SetRenderTarget(plateWidgetData.texture)
+				if err != nil {
+					panic("failed to set render target to plateWidgetData.texture: " + err.Error())
+				}
+				defer func() {
+					err = p.renderer.SetRenderTarget(nil)
+					if err != nil {
+						panic("failed to reset render target: " + err.Error())
+					}
+				}()
+				previousDrawColorR, previousDrawColorG, previousDrawColorB, previousDrawColorA, err := renderer.GetDrawColor()
+				if err != nil {
+					panic("failed to set draw color: " + err.Error())
+				}
+				defer func() {
+					err := renderer.SetDrawColor(previousDrawColorR, previousDrawColorG, previousDrawColorB, previousDrawColorA)
+					if err != nil {
+						panic("failed to reset draw color: " + err.Error())
+					}
+				}()
+				err = p.renderer.Clear()
+				if err != nil {
+					panic("failed to clear plateWidgetData.texture: " + err.Error())
+				}
+			}
+
+			// XXX: i think there's useless redundancy here right now because I [...]
+			freshInfoTextWidgetFromIS.render = func(w *Widget, p *ProgramContext) {
+				var data, ok = w.data.(*GUIInfoTextWidgetData)
+				if !ok {
+					panic("failed assert: type assert failed in freshInfoText[...].render on GUIInfoTextWidget data!")
+				}
+				plateWidgetData, ok := data.mandatoryChildren.plateWidget.data.(*GUIPlateWidgetData)
+				if !ok {
+					panic("failed assert: type assert failed in freshInfoText[...].render on GUIPlateWidget data!")
+				}
+				textWidgetData, ok := data.mandatoryChildren.textWidget.data.(*GUITextWidgetData)
+				if !ok {
+					panic("failed assert: type assert failed in freshInfoText[...].render on GUIPlateWidget data!")
+				}
+
+				// HACK: this is a bad place to put this and our data should be ready beforehand.
+				// this is just to get a working GUI so I can go to the next iteration.
+				if plateWidgetData.texture == nil {
+					plateWidgetData.texture, err = p.renderer.CreateTexture(sdl.PIXELFORMAT_RGBA8888, sdl.TEXTUREACCESS_TARGET, 1, 1)
+					if err != nil {
+						panic(err)
+						// XXX: completed this part without remembering the context
+					}
+				}
+				if textWidgetData.texture == nil {
+					textWidgetData.texture, err = p.renderer.CreateTexture(sdl.PIXELFORMAT_RGBA8888, sdl.TEXTUREACCESS_TARGET, 1, 1)
+					if err != nil {
+						panic(err)
+						// XXX: completed this part without remembering the context
+					}
+				}
+
+				_, _, plateWidgetTextureW, plateWidgetTextureH, err := plateWidgetData.texture.Query()
+				if err != nil {
+					panic("failed to query plateWidgetTexture: " + err.Error())
+				}
+				_, _, textWidgetTextureW, textWidgetTextureH, err := textWidgetData.texture.Query()
+				if err != nil {
+					panic("failed to query textWidgetTexture: " + err.Error())
+				}
+				var textAbsolutePosition = getAbsolutePosition(data.mandatoryChildren.textWidget)
+				var plateAbsolutePosition = getAbsolutePosition(data.mandatoryChildren.plateWidget)
+
+				err = p.renderer.Copy(plateWidgetData.texture, &sdl.Rect{0, 0, plateWidgetTextureW, plateWidgetTextureH},
+					&sdl.Rect{plateAbsolutePosition[0], plateAbsolutePosition[1], plateWidgetTextureW, plateWidgetTextureH})
+				if err != nil {
+					panic("failed to copy plateWidget texture: " + err.Error())
+				}
+
+				err = p.renderer.Copy(textWidgetData.texture, &sdl.Rect{0, 0, textWidgetTextureW, textWidgetTextureH},
+					&sdl.Rect{textAbsolutePosition[0], textAbsolutePosition[1], textWidgetTextureW, textWidgetTextureH})
+				if err != nil {
+					panic("failed to copy textWidget texture: " + err.Error())
+				}
+				// does not handle present() - only the scene does
+			}
+
+			freshInfoTextWidgetFromIS.handleIntent = func(w *Widget, p *ProgramContext, i Intent) {}
+			freshInfoTextWidgetFromIS.dataIsReady = func(w *Widget, p *ProgramContext) bool {
+				for _, _ = range w.optionalChildren {
+					panic("failed assert: GUIInfoTextWidget has optional children, when it shouldn't!")
+				}
+				var data, ok = w.data.(*GUIInfoTextWidgetData)
+				if !ok {
+					panic("failed assert: type assertion failed in freshInfoText[...].dataIsReady on " +
+						"GUIInfoTextWidget data!")
+				}
+				if !data.mandatoryChildren.plateWidget.dataIsReady(data.mandatoryChildren.plateWidget, p) ||
+					data.mandatoryChildren.textWidget.dataIsReady(data.mandatoryChildren.textWidget, p) {
+					return false
+				}
+				return true
+			}
+			freshInfoTextWidgetFromIS.initData(freshInfoTextWidgetFromIS, p)
+			if !freshInfoTextWidgetFromIS.validate() {
+				panic("failed assert: failed to validate freshInfoTextWidget in " +
+					"guiInfoTextListWidget.update()!")
+			}
+
+			w.optionalChildren = append(w.optionalChildren, freshInfoTextWidgetFromIS)
+		}
+
+		// let those children update themselves
+		for _, c := range w.optionalChildren {
+			c.update(c, p)
+		}
+	}
+
+	guiInfoTextListWidget.render = func(w *Widget, p *ProgramContext) {
+		for _, c := range w.optionalChildren {
+			c.render(c, p)
+		}
+	}
+
+	guiInfoTextListWidget.handleIntent = func(w *Widget, p *ProgramContext, i Intent) {
+		// given you can possible toggle different parts of the UI, those need to stay in state somewhere in the
+		// program context
+		// in fact, why are the widgets handling intent in the first place again?
+
+		/* if i.intentType == IntentToggleGUIInfoTextList {
+			w.data.hidden = !w.data.hidden
+			for _, c := range w.optionalChildren {
+				c.handleIntent(w, p, i)
+			}
+		} */
+	}
+
+	ok := guiInfoTextListWidget.validate()
+	if !ok {
+		panic("failed assert: guiInfoTextListWidget failed to validate!")
+	}
+	guiBaseWidget.registerOptionalChildWidget(&guiInfoTextListWidget)
+
+	var programContext = ProgramContext{
+		window:          window,
+		renderer:        renderer,
+		programSettings: (&ProgramSettings{}).initialize(),
+	}
+
+	rootWidget.initData(&rootWidget, &programContext)
+
+	var sceneStack = SceneStack{
+		scenes: []*Scene{},
+	}
+
+	// REVIEW: is this fine?
+	programContext.sceneStack = &sceneStack
+
+	programContext.inputHistory = (&InputHistoryType{}).initialize()
+	programContext.inputHistory.pushFront((&inputStateType{}).initialize())
+
+	// programContext.programSettings.StyleSheet = (&StyleSheet{}).initialize()
+	err = ttf.Init()
+	if err != nil {
+		panic("failed to init ttf: " + err.Error())
+	}
+	font, err := ttf.OpenFont(programContext.programSettings.DefaultFontLocation, programContext.programSettings.DefaultFontSize)
+	if err != nil {
+		panic("failed to open font: " + err.Error())
+	}
+	programContext.programSettings.StyleSheet.guiTextWidgetStyle.font = font
+	programContext.programInfoCache = &ProgramInfoCache{}
+
+	if !rootWidget.validate() {
+		panic("failed assert: rootWidget failed to validate")
+	}
+	if !programContext.validate() {
+		panic("failed assert: program context did not validate")
+	}
+
+	// sanity check
+	ok = checkIfParentsAndChildrenKnowEachOther([]*Widget{
+		&rootWidget,
+		&plotWidget,
+		&guiBaseWidget,
+		&guiInfoTextListWidget,
+	})
+	if !ok {
+		// TODO: phrasing?
+		panic("failed assert: for some parent and child Widget pair during checkIfParentsAndChildrenKnowEachOther()" +
+			", mutual knowledge is asymmetric!")
+	}
+
+	// set up initScene
+
+	var initScene = *getFreshInitScene(&rootWidget)
 
 	if !initScene.validate() {
 		panic("failed assert: failed to validate initScene")
 	}
 
 	// load settings
-	programContext.programSettings, err = loadProgramSettings()
-	if err != nil {
-		programContext.programSettings = (&ProgramSettings{}).initialize()
-		// save later, now that it works
-		/*initSettingsFile()
-		programContext.programSettings, err = loadProgramSettings()
-		if err != nil {
-			// maybe fall back to default settings without file?
-			panic("could not create settings file: " + err.Error())
-		} */
+	loadedProgramSettings, err := loadProgramSettings()
+	if err == nil {
+		programContext.programSettings = loadedProgramSettings
 	}
 
 	// skipping this test for now
@@ -1116,9 +1914,18 @@ func main() {
 	sceneStack.Replace(&initScene, &programContext)
 
 	// ok because we know what the top scene is
-	var intent = initScene.determineIntent(&initScene, &programContext)
-	initScene.handleIntent(&initScene, &programContext, intent)
+	// var intent = initScene.determineIntent(&initScene, &programContext) // no reason to do this
+	initScene.handleIntent(&initScene, &programContext, Intent{IntentStart, IntentParametersStart{}})
 	initScene.render(&initScene, &programContext)
+
+	// profiling
+	f, err := os.Create("cpu.prof")
+	if err != nil {
+		log.Fatal("could not create CPU profile: ", err)
+	}
+	if err := pprof.StartCPUProfile(f); err != nil {
+		log.Fatal("could not start CPU profile: ", err)
+	}
 
 	// main event loop
 	for e := sdl.PollEvent(); true; e = sdl.PollEvent() {
@@ -1130,6 +1937,7 @@ func main() {
 		// i think a close intent is helpful maybe, that closes the active GUI widget/element/state broadly?
 		switch e.(type) {
 		case *sdl.QuitEvent:
+			pprof.StopCPUProfile()
 			sdl.Quit()
 			os.Exit(0)
 		}
@@ -1147,6 +1955,7 @@ func main() {
 		// topScene.handleEvent(topScene, &programContext, &inputState)
 		var intent Intent = topScene.determineIntent(topScene, &programContext)
 		topScene.handleIntent(topScene, &programContext, intent)
+		topScene.render(topScene, &programContext)
 	}
 }
 
@@ -1165,6 +1974,7 @@ func sdlEventTypeIsInputType(eventType uint32) bool {
 		sdl.MOUSEBUTTONUP,
 		sdl.KEYDOWN,
 		sdl.KEYUP,
+		sdl.MOUSEMOTION,
 	}
 	// HACK?: generating this every time the function is called. shouldn't affect performance yet
 	for _, x := range inputTypes {
@@ -1238,6 +2048,9 @@ func registerInputFromSDLEvent(p *ProgramContext, inputState *inputStateType, e 
 		case sdl.K_z:
 			nextInputState.keys[keyZoom].pressed = pressed
 			nextInputState.keys[keyZoom].released = released
+		case sdl.K_r:
+			nextInputState.keys[keyResetView].pressed = pressed
+			nextInputState.keys[keyResetView].released = released
 		default:
 			log.Default().Println("NOTE: key pressed that will not be registered: sym " + string(ev.Keysym.Sym))
 		}
@@ -1309,22 +2122,55 @@ func registerInputFromSDLEvent(p *ProgramContext, inputState *inputStateType, e 
 func regenPlotValues(p *ProgramContext) *[]int16 {
 	// this might be expensive...
 	var out = make([]int16, p.programSettings.PlotResX*p.programSettings.PlotResY)
-
-	for i := range out {
-		if i > math.MaxInt32 {
-			// off by one maybe but it's inconsequential right now
-			panic("failed assert: more than MaxInt32 + 1 values in plot!")
-		}
-		// y coord
-		// HACK: lossy type cast from int32 to uint32 (there's no reason it should matter in a RL scenario)
-		var quotient = uint32(i) / uint32(p.programSettings.PlotResX)
-		var remainder = uint32(i) % uint32(p.programSettings.PlotResX)
-		var currentPlotScreenCoord = [2]uint32{remainder, quotient}
-		var currentPlotPlaneCoord = convertPlotScreenCoordToPlotPlane(currentPlotScreenCoord, p)
-		var currentPlotValue = calculatePlotValueFromPlaneCoord(currentPlotPlaneCoord, p)
-		out[i] = currentPlotValue
+	var wg sync.WaitGroup
+	var chunks int32 = 1
+	var chunkSize int32 = p.programSettings.PlotResX * p.programSettings.PlotResY
+	if p.programSettings.PlotResX%8 == 0 {
+		chunks = 8
+		chunkSize = (p.programSettings.PlotResX * p.programSettings.PlotResY) / 8
 	}
+	for i := int32(0); i < chunks; i++ {
+		wg.Add(1)
+		// with 8 goroutines, this takes about 1.5s on my laptop
+		go func() {
+			defer wg.Done()
+			start := int32(i) * chunkSize
+			end := (int32(i) + 1) * chunkSize
+			for i = start; i < end; i++ {
+				if i > math.MaxInt32 {
+					// off by one maybe but it's inconsequential right now
+					panic("failed assert: more than MaxInt32 + 1 values in plot!")
+				}
+				// y coord
+				// HACK: lossy type cast from int32 to uint32 (there's no reason it should matter in a RL scenario)
+				var quotient = uint32(i) / uint32(p.programSettings.PlotResX)
+				var remainder = uint32(i) % uint32(p.programSettings.PlotResX)
+				var currentPlotScreenCoord = [2]uint32{remainder, quotient}
+				var currentPlotPlaneCoord = convertPlotScreenCoordToPlotPlane(currentPlotScreenCoord, p)
+				var currentPlotValue = calculatePlotValueFromPlaneCoord(currentPlotPlaneCoord, p)
+				out[i] = currentPlotValue
+			}
+		}()
+	}
+	wg.Wait()
 	return &out
+}
+
+func (p *ProgramContext) regenInfoText() {
+	p.programInfoCache.infoStrings = [numInfoStringKinds]InfoString{}
+	var hoverCoordString = "current hover coord: (" +
+		strconv.Itoa(int(p.programInfoCache.lastKnownHoverCoord[0])) +
+		", " + strconv.Itoa(int(p.programInfoCache.lastKnownHoverCoord[1])) + ")"
+	p.programInfoCache.infoStrings[infoStringKindHoverScreenCoord] = InfoString{
+		infoStringKindHoverScreenCoord,
+		hoverCoordString,
+	}
+	p.programInfoCache.infoStrings[infoStringKindHoverPlaneCoord] = InfoString{
+		infoStringKindHoverPlaneCoord,
+		"current hover coord in complex plane: " +
+			fmt.Sprintf("(%.6f, %.6f)", real(convertPlotScreenCoordToPlotPlane(p.programInfoCache.lastKnownHoverCoord, p)),
+				imag(convertPlotScreenCoordToPlotPlane(p.programInfoCache.lastKnownHoverCoord, p))),
+	}
 }
 
 // plotScreen coord is in the range 0-PlotResX, 0-PlotResY
@@ -1515,12 +2361,184 @@ func getUnhandledButtonPresses(in *InputHistoryType) []*inputStateType {
 	var unhandledButtonPresses []*inputStateType
 	var inCopyWithoutButtonPresses InputHistoryType
 	for _, iS := range in.inputs {
-		if iS.keys[keyZoom].pressed {
+		// will this cause issues?
+		if iS.keys[keyZoom].pressed || iS.keys[keyResetView].pressed {
 			unhandledButtonPresses = append(unhandledButtonPresses, iS)
+			// if two pressed at the same time, keyZoom takes priority
 		} else {
 			inCopyWithoutButtonPresses.inputs = append(inCopyWithoutButtonPresses.inputs, iS)
 		}
 	}
 	*in = inCopyWithoutButtonPresses
 	return unhandledButtonPresses
+}
+
+func checkIfParentsAndChildrenKnowEachOther(widgets []*Widget) bool {
+	for _, w := range widgets {
+		for _, child := range w.optionalChildren {
+			if child.parent != w {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// NOTE: regenerating the functions every time is probably very inefficient.
+// i might consider instantiating them from a prototype next iteration
+func getFreshPlateWidget(parent *Widget) *Widget {
+	var freshPlateWidget = &Widget{
+		// come back to this
+		kind:             guiPlateWidgetKind,
+		parent:           parent,
+		optionalChildren: []*Widget{},
+		data:             &GUIPlateWidgetData{},
+
+		initData:     nil,
+		update:       nil,
+		render:       nil,
+		handleIntent: nil,
+		dataIsReady:  nil,
+		dataIsSane:   nil,
+	}
+	freshPlateWidget.initData = func(w *Widget, p *ProgramContext) {
+		var data, ok = w.data.(*GUIPlateWidgetData)
+		if !ok {
+			panic("failed assert: data not of type *GUIPlateWidgetData " +
+				"in type assert in freshPlateWidget.initData()!")
+		}
+		var err error
+		data.texture, err = p.renderer.CreateTexture(sdl.PIXELFORMAT_RGBA8888, sdl.TEXTUREACCESS_TARGET, 1, 1)
+		if err != nil {
+			panic("failed to create texture in freshPlateWidget.initData(): " + err.Error())
+		}
+	}
+	freshPlateWidget.update = func(w *Widget, p *ProgramContext) {
+		panic("failed assert: freshPlateWidget.update() called, but freshPlateWidget does not update itself! " +
+			"(why did the parent propagate update downwards?)")
+	}
+	freshPlateWidget.render = func(w *Widget, p *ProgramContext) {
+		var absolutePosition = getAbsolutePosition(w)
+		var data, ok = w.data.(*GUIPlateWidgetData)
+		if !ok {
+			panic("failed assert: freshPlateWidget.render tried to type assert data, but was not of apparent type *GUIPlateWidgetData!")
+		}
+		_, _, W, H, err := data.texture.Query()
+		err = p.renderer.Copy(data.texture, &sdl.Rect{0, 0, W, H}, &sdl.Rect{absolutePosition[0], absolutePosition[1], W, H})
+		if err != nil {
+			panic("failed to copy freshPlateWidget texture: " + err.Error())
+		}
+	}
+	freshPlateWidget.handleIntent = func(w *Widget, p *ProgramContext, i Intent) {
+
+	}
+	freshPlateWidget.dataIsReady = func(w *Widget, p *ProgramContext) bool {
+		data, ok := w.data.(*GUIPlateWidgetData)
+		if !ok {
+			panic("failed assert: data not of expected type during type assert in freshPlateWidget.dataIsReady()!")
+		}
+		_, _, W, H, err := data.texture.Query()
+		if err != nil {
+			panic("failed to query texture: " + err.Error())
+		}
+		if W == 1 && H == 1 {
+			return false
+		}
+		return true
+	}
+	freshPlateWidget.dataIsSane = func(w *Widget, p *ProgramContext) bool {
+		if w.data == nil {
+			return false
+		}
+		data, ok := w.data.(*GUIPlateWidgetData)
+		if !ok {
+			panic("failed assert: data not of expected type (failed type assert) in freshPlateWidget.dataIsSane()!")
+		}
+		if data.texture == nil {
+			return false
+		}
+		return true
+	}
+	if !freshPlateWidget.validate() {
+		panic("failed assert: freshPlateWidget failed to validate in getFreshPlateWidget()!")
+	}
+	return freshPlateWidget
+}
+func getFreshTextWidget(parent *Widget) *Widget {
+	var freshTextWidget = &Widget{
+		kind:             guiTextWidgetKind,
+		parent:           parent,
+		optionalChildren: []*Widget{},
+		data:             &GUITextWidgetData{},
+
+		initData:     nil,
+		update:       nil,
+		render:       nil,
+		handleIntent: nil,
+		dataIsReady:  nil,
+		dataIsSane:   nil,
+	}
+	freshTextWidget.initData = func(w *Widget, p *ProgramContext) {}
+	freshTextWidget.update = func(w *Widget, p *ProgramContext) {
+		// the widget shouldn't update itself in this current iteration, that's
+		// handled by a parent
+		panic("failed assert: freshTextWidget.update() called, but parent should handle updates!")
+	}
+	freshTextWidget.render = func(w *Widget, p *ProgramContext) {
+		// would it be better to use an ECS for GUI stuff?
+		data, ok := w.data.(*GUITextWidgetData)
+		if !ok {
+			panic("failed assert: type assert failed on data in freshTextWidget.render()!")
+		}
+		absolutePosition := getAbsolutePosition(w)
+		_, _, W, H, err := data.texture.Query()
+		if err != nil {
+			panic("failed to query texture: " + err.Error())
+		}
+		err = p.renderer.Copy(data.texture, &sdl.Rect{0, 0, W, H}, &sdl.Rect{absolutePosition[0], absolutePosition[1], W, H})
+		if err != nil {
+			panic("failed to copy texture: " + err.Error())
+		}
+	}
+	freshTextWidget.handleIntent = func(w *Widget, p *ProgramContext, i Intent) {
+
+	}
+	freshTextWidget.dataIsReady = func(w *Widget, p *ProgramContext) bool {
+		return true
+	}
+	freshTextWidget.dataIsSane = func(w *Widget, p *ProgramContext) bool {
+		return true
+	}
+	if !freshTextWidget.validate() {
+		panic("failed assert: freshTextWidget failed to validate in getFreshTextWidget()!")
+	}
+	return freshTextWidget
+}
+
+/*
+func createInfoTextWidgetFromIS(iS InfoString) *Widget {
+	var itWidgetFromIS = &Widget{
+		// leaving dimensions undefined
+
+		kind: guiInfoTextWidgetKind,
+		parent: w,
+
+		data: &GUIInfoTextWidgetData{
+			correspondingInfoString: iS.infoStringKind,
+		},
+
+
+
+	}
+} */
+
+func rangeInts(min int32, oneovermax int32) []int {
+	var out = []int{}
+	for i := range oneovermax - min {
+		out = append(out, int(i)+int(min))
+	}
+	if len(out) != int(oneovermax-min) {
+		panic("failed assert: length of rangeInts output incorrect!")
+	}
+	return out
 }
