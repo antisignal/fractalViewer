@@ -383,7 +383,7 @@ func (s *StyleSheet) initialize() *StyleSheet {
 	s.guiPlateWidgetStyle = &GUIPlateWidgetStyle{
 		plateColor: &sdl.Color{G: 255, B: 255, A: 255},
 		innerPadding: styleInfoInnerPadding{
-			paddingPixels:     [4]uint32{5, 5, 5, 5},
+			paddingPixels:     [4]uint32{0, 0, 0, 0}, // was 5,5,5,5 on 08-31-25
 			paddingProportion: [4]float64{0, 0, 0, 0},
 		},
 	}
@@ -500,7 +500,7 @@ func (p *ProgramSettings) initialize() *ProgramSettings {
 			},
 			guiPlateWidgetStyle: &GUIPlateWidgetStyle{
 				innerPadding: styleInfoInnerPadding{
-					paddingPixels: [4]uint32{5, 5, 5, 5},
+					paddingPixels: [4]uint32{0, 0, 0, 0}, // was 5,5,5,5 on 08-31-25
 				},
 				plateColor: &sdl.Color{0, 0, 0, 255},
 			},
