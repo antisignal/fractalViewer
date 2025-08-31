@@ -1,6 +1,6 @@
 A fractal viewer written in Go and SDL2.
 
-![test](https://i.ibb.co/rfzZpzXT/simplescreenrecorder-2025-08-31-12-54-44-online-video-cutter-com.gif)
+![test](https://github.com/antisignal/fractalViewer/blob/third-revision-jul625/simplescreenrecorder-2025-08-31_12.54.44%20(online-video-cutter.com).gif?raw=true)
 
 
 It has the following features:
