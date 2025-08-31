@@ -302,9 +302,6 @@ type GUIBaseWidgetData struct {
 type GUIInfoTextListWidgetData struct {
 }
 
-// XXX: does baking the style into the widget defeat the purpose of my other design decisions? as in,
-// should style be passed upon generating the widget while the widget itself remains agnostic to it?
-// response: I'm moving forward with it left out
 type GUIInfoTextWidgetData struct {
 	correspondingInfoString InfoStringKind
 	mandatoryChildren       GUIInfoTextWidgetMandatoryChildren
@@ -324,7 +321,6 @@ type GUIInfoTextListWidgetStyle struct {
 	paddingBetweenEntries int
 }
 
-// TODO: should padding be pixels or proportion of the screen? or a hybrid method?
 type GUIInfoTextWidgetStyle struct {
 	innerPadding styleInfoInnerPadding
 }
@@ -346,12 +342,6 @@ type styleInfoInnerPadding struct {
 	paddingProportion [4]float64
 }
 
-// must be populated for every type of widget
-// TODO: have a const declaration with every type of widget, then have each widget instance have a field
-// widgetType that stores the type of widget, so I can index into an array of widget styles?
-// maybe also have a function which createsWidgetFromTypeWithoutChildren() or something which references
-// the style array?
-// this sounds like an iteration 4 thing
 type StyleSheet struct {
 	rootWidgetStyle            *rootWidgetStyle
 	plotWidgetStyle            *plotWidgetStyle
@@ -394,7 +384,6 @@ type rootWidgetStyle struct{}
 type plotWidgetStyle struct{}
 type GUIBaseWidgetStyle struct{}
 
-// TODO: should the StyleSheet be part of the programSettings? (yes!)
 type ProgramContext struct {
 	window           *sdl.Window
 	renderer         *sdl.Renderer
@@ -477,7 +466,6 @@ func (p *ProgramSettings) initialize() *ProgramSettings {
 				ModuloPaletteEntry{&sdl.Color{106, 52, 3, 255}, 15},
 			},
 		},
-		// HACK: (?) is this (unitview and view having separate heap objects) wasteful? does it even matter?
 		PreferredColorMethod:    ColorMethodModulo,
 		UnitView:                &FRect{-2, -1.5, 4, 3},
 		View:                    &FRect{-2, -1.5, 4, 3},
@@ -509,7 +497,6 @@ func (p *ProgramSettings) initialize() *ProgramSettings {
 }
 
 // config not human readable for now
-// also dooooes this introduce any security concerns?
 func saveProgramSettings(p *ProgramSettings) error {
 	var settingsString, err = json.Marshal(*p)
 	if err != nil {
@@ -526,7 +513,7 @@ func saveProgramSettings(p *ProgramSettings) error {
 			panic(err)
 		}
 	} else {
-		// someone on stackoverflow said this was fine for all non-windows systems. there might be edge cases I
+		// TODO: someone on stackoverflow said this was fine for all non-windows systems. there might be edge cases I
 		// need to consider.
 		err := os.MkdirAll(SettingsPathNix, 0755)
 		if err != nil {
@@ -590,9 +577,6 @@ func (p *ProgramContext) validate() bool {
 	if !p.programSettings.validate() {
 		return false
 	}
-	/* if p.programSettings.View == nil || p.programSettings.UnitView == nil || p.programSettings.ColorPalette == nil {
-		return false
-	} */
 	return true
 }
 
@@ -656,7 +640,6 @@ const (
 	numGUIPaletteItems    = iota
 )
 
-// check: does this fragment anything, or add redundancy in an unhelpful way?
 const (
 	rootWidgetKind            = iota
 	plotWidgetKind            = iota
@@ -715,8 +698,6 @@ func (i *inputStateType) validate() bool {
 	return true
 }
 
-// should this be a []iST or []*iST?
-// inputHistory needs entries to be immutable, but history itself to be changeable
 type InputHistoryType struct {
 	inputs []*inputStateType
 }
@@ -727,7 +708,6 @@ func (i *InputHistoryType) initialize() *InputHistoryType {
 }
 
 // we have intents which contain a type and parameters, which are an interface
-
 type Intent struct {
 	intentType       uint8
 	intentParameters IntentParameters
@@ -806,8 +786,6 @@ const (
 )
 
 func (w *Widget) validate() bool {
-	// conditions not yet known
-	// if dataIsSane == nil
 	if w == nil || w.render == nil || w.handleIntent == nil {
 		return false
 	}
@@ -842,14 +820,6 @@ func getFreshRootWidget() *Widget {
 		optionalChildren: []*Widget{},
 		render:           nil,
 		dataIsReady: func(w *Widget, p *ProgramContext) bool {
-			/* var wData, ok = w.data.(*rootWidgetData)
-			// panic here or just return false?
-			if !ok {
-				panic("failed assertion: type assertion of rootWidget data failed!")
-			}
-			if wData.cachedTexture == nil {
-				return false
-			} */
 			for _, child := range w.optionalChildren {
 				if !child.dataIsReady(child, p) {
 					return false
@@ -861,28 +831,6 @@ func getFreshRootWidget() *Widget {
 	}
 
 	rootWidget.render = func(w *Widget, p *ProgramContext) {
-		/* var data, ok = w.data.(*rootWidgetData)
-		if !ok {
-			panic("failed assertion: type assertion of rootWidget data failed!")
-		}
-		var tex = data.cachedTexture
-		// on nil texture, panic instead of trying to continue. this probably means something's wrong
-		if tex == nil {
-			panic("failed to render rootWidget texture (nil reference and no fallback)")
-		}
-		// quick assert
-		_, _, texW, texH, err := (*tex).Query()
-		if err != nil {
-			panic("failed to query rootWidget texture: " + err.Error())
-		}
-		if texW != rootWidget.W || texH != rootWidget.H {
-			panic("failed assert: texture size does not match rootWidget size!")
-		}
-		err = p.renderer.Copy(tex, &sdl.Rect{W: w.W, H: w.H}, &sdl.Rect{X: w.X, Y: w.Y, W: w.W, H: w.H})
-		if err != nil {
-			panic("renderer failed to copy texture in rootWidget render: " + err.Error())
-		}
-		p.renderer.Present() */
 		for _, child := range w.optionalChildren {
 			child.render(child, p)
 		}
@@ -890,45 +838,6 @@ func getFreshRootWidget() *Widget {
 	rootWidget.handleIntent = func(w *Widget, p *ProgramContext, i Intent) {
 		// asserts are assumed to pass, but it's possible to change the dimensions of the texture at runtime and I don't like that.
 		// maybe there's a solution somewhere (7/2/25: should I have a dataSanityCheck function?)
-		// placeholder
-		/* data, ok := w.data.(*rootWidgetData)
-		if !ok {
-			panic("failed assert: type assertion of rootWidget data failed!")
-		}
-		 if data.cachedTexture == nil {
-			data.cachedTexture, err = p.renderer.CreateTexture(sdl.PIXELFORMAT_RGBA8888, sdl.TEXTUREACCESS_TARGET, w.W, w.H)
-			err = p.renderer.SetRenderTarget(data.cachedTexture)
-			if err != nil {
-				panic(err)
-			}
-			defer func() {
-				err = p.renderer.SetRenderTarget(nil)
-				if err != nil {
-					panic(err)
-				}
-			}()
-			previousDrawColorR, previousDrawColorG, previousDrawColorB, previousDrawColorA, err := p.renderer.GetDrawColor()
-			var settingsColor = p.programSettings.TestRectangleColor
-			// err = p.renderer.SetDrawColor(255, 0, 0, 255)
-			err = p.renderer.SetDrawColor(settingsColor.R, settingsColor.G, settingsColor.B, settingsColor.A)
-			if err != nil {
-				panic(err)
-			}
-			defer func() {
-				err := p.renderer.SetDrawColor(previousDrawColorR, previousDrawColorG, previousDrawColorB, previousDrawColorA)
-				if err != nil {
-					return
-				}
-			}()
-			err = p.renderer.Clear()
-			if err != nil {
-				panic(err)
-			}
-		} else {
-			err = p.renderer.Copy(data.cachedTexture, &sdl.Rect{0, 0, w.W, w.H}, &sdl.Rect{w.X, w.Y, w.W, w.H})
-		} */
-
-		// w.update(w, p) // commented out as an experiment on 2025-08-28
 		switch i.intentType {
 		case IntentMoveMouse:
 			for _, child := range w.optionalChildren {
@@ -1017,7 +926,6 @@ func getFreshPlotWidget(rootWidget *Widget) *Widget {
 		err = p.renderer.Copy(tex, &sdl.Rect{
 			0, 0, plotWidget.W, plotWidget.H}, &sdl.Rect{
 			absolutePosition[0], absolutePosition[1], plotWidget.W, plotWidget.H})
-		// p.renderer.Present()
 	}
 	// XXX: i'm pretty sure I have no way of marking a click event as handled here. this needs to be looked at later.
 	plotWidget.handleIntent = func(w *Widget, p *ProgramContext, i Intent) {
@@ -1077,18 +985,9 @@ func getFreshPlotWidget(rootWidget *Widget) *Widget {
 		if len(*data.cachedPlotValues) != int(p.programSettings.PlotResX)*int(p.programSettings.PlotResY) {
 			panic("failed assert: len of cachedPlotValues does not match settings!")
 		}
-
-		// deprecated because we use Intents now
-		/* var currentInputState = p.inputHistory.top()
-		if currentInputState.mouseButtons[mouseButtonLeft] {
-			var mouseX, mouseY, _ = sdl.GetMouseState()
-			var coord = convertPlotScreenCoordToPlotPlane([2]int32{mouseX, mouseY}, p)
-			changePlotView(p, 1, coord)
-		} */
-
 		data.cachedPlotValues = regenPlotValues(p)
 		colorPlotWidgetTextureFromValues(w, p)
-		// w.render(w, p) COMMENTED AS A TEST
+		// w.render(w, p) commented as a test - this rendering is probably redundant
 	}
 	return plotWidget
 }
@@ -1140,13 +1039,6 @@ func getFreshGUIBaseWidget(rootWidget *Widget) *Widget {
 	GUIBaseWidget.initData = func(w *Widget, p *ProgramContext) {
 	}
 	GUIBaseWidget.dataIsReady = func(w *Widget, p *ProgramContext) bool {
-		/* var data, ok = w.data.(*GUIBaseWidgetData)
-		if !ok {
-			panic("failed assert: type assert in GUIBaseWidget.dataIsReady failed (on data!)")
-		}
-		if data.cachedTexture == nil {
-			return false
-		} */
 		return true
 	}
 	GUIBaseWidget.dataIsSane = func(w *Widget, p *ProgramContext) bool { return true }
@@ -1170,7 +1062,7 @@ func getFreshGUIInfoTextListWIdget(guiBaseWidget *Widget) *Widget {
 		// each of their rendering functions is just copying their cached texture (from their data field) to
 		// their absolute position
 
-		// my other thought process: destroy all the children (diabolical), regen the text, regen the plate,
+		// my other thought process: destroy all the children, regen the text, regen the plate,
 		// set the offsets, determine position of self relative to base widget, render the plate at its absolute position,
 		// render the text at its absolute position,
 
@@ -1195,9 +1087,12 @@ func getFreshGUIInfoTextListWIdget(guiBaseWidget *Widget) *Widget {
 			childData.mandatoryChildren.plateWidget.update(w, p) // this should also update the size of the plate widget
 			// now we set the positions of each based on the StyleSheet
 			// TODO: make this also take paddingProportion into account
-			// XXX: conversion from uint32 to int32 (should not matter, but needs review later)
-
-			// XXX: check this
+			for i := range 4 {
+				if p.programSettings.StyleSheet.guiInfoTextWidgetStyle.innerPadding.paddingPixels[i] > math.MaxInt32 {
+					log.Fatal("invalid style: paddingPixels value too large to convert to int32")
+				}
+			}
+			// TODO: check this for accuracy
 			childData.mandatoryChildren.plateWidget.X = w.W -
 				(int32(p.programSettings.StyleSheet.guiInfoTextWidgetStyle.innerPadding.paddingPixels[paddingLeft]) +
 					(int32(p.programSettings.StyleSheet.guiInfoTextWidgetStyle.innerPadding.paddingPixels[paddingRight]) +
@@ -1212,22 +1107,10 @@ func getFreshGUIInfoTextListWIdget(guiBaseWidget *Widget) *Widget {
 			childData.mandatoryChildren.textWidget.Y = childData.mandatoryChildren.plateWidget.Y +
 				int32(p.programSettings.StyleSheet.guiPlateWidgetStyle.innerPadding.paddingPixels[paddingTop])
 		}
-
-		/* freshGUIInfoTextListWidget.optionalChildren = []*Widget{}
-		for i, x := range p.programInfoCache.infoStrings {
-			var newGUIInfoTextWidget = &Widget{
-				kind: guiInfoTextListWidgetKind,
-			}
-			if !newGUIInfoTextWidget.validate() {
-				panic("failed assert: newGUIInfoTextWidget in GUIBaseWidget.update() failed to validate!")
-			}
-			w.optionalChildren = append(w.optionalChildren, newGUIInfoTextWidget)
-		} */
 	}
 
 	freshGUIInfoTextListWidget.render = func(w *Widget, p *ProgramContext) {
 		// we need a z buffer in the next iteration
-
 	}
 	return freshGUIInfoTextListWidget
 }
@@ -1302,7 +1185,7 @@ func getFreshInitScene(rootWidget *Widget) *Scene {
 		s.dataIsReady = func(s *Scene, p *ProgramContext) bool {
 			panic("failed assert: scene method called after destroy called (dataIsReady)")
 		}
-		// uhh is this going to cause problems given I'm updating s.destroy() with s.destroy()?
+		// is this going to cause problems given I'm updating s.destroy() with s.destroy()?
 		s.destroy = func(s *Scene) {
 			panic("failed assert: scene method called after destroy called (destroy, ironically)")
 		}
@@ -1378,7 +1261,6 @@ func getFreshInitScene(rootWidget *Widget) *Scene {
 			}
 			// HACK: in doing this we don't verify the change propagated as a defensive measure before
 			// fixing next commit
-			// if p.programSettings.View.W != p.programSettings.UnitView.W *
 			// XXX: should this be handled by the widget or by the scene? i suspect the scene needs to handle it,
 			// then make the plotWidget update
 			// XXX: if I add lastScale and lastCenter to the programSettings,
@@ -1399,12 +1281,11 @@ func getFreshInitScene(rootWidget *Widget) *Scene {
 			}
 			// NOTE: this would be much cleaner and probably more reliable if I didn't have to
 			// approximate the parameters based on the existing view
-			var approxOldCenter complex128 = complex128(complex(
+			var approxOldCenter complex128 = complex(
 				p.programSettings.View.X+(p.programSettings.View.W/2),
-				p.programSettings.View.Y+(p.programSettings.View.H/2)))
+				p.programSettings.View.Y+(p.programSettings.View.H/2))
 			var approxOldScale float64 = p.programSettings.View.W / p.programSettings.UnitView.W
-			// HACK: lossy conversion from float64 to float32
-			changePlotView(p, float64(params.factor)*approxOldScale, approxOldCenter)
+			changePlotView(p, params.factor*approxOldScale, approxOldCenter)
 			p.regenInfoText()
 			for _, w := range data.widgets {
 				w.update(w, p)
@@ -1509,7 +1390,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	window.SetTitle("fractal viewer prototype 3!!! :DDD")
+	window.SetTitle("fractal viewer prototype 3")
 	// setup rootWidget
 
 	var rootWidget = *getFreshRootWidget()
@@ -1792,16 +1673,8 @@ func main() {
 	}
 
 	guiInfoTextListWidget.handleIntent = func(w *Widget, p *ProgramContext, i Intent) {
-		// given you can possible toggle different parts of the UI, those need to stay in state somewhere in the
+		// given you can possibly toggle different parts of the UI, those need to stay in state somewhere in the
 		// program context
-		// in fact, why are the widgets handling intent in the first place again?
-
-		/* if i.intentType == IntentToggleGUIInfoTextList {
-			w.data.hidden = !w.data.hidden
-			for _, c := range w.optionalChildren {
-				c.handleIntent(w, p, i)
-			}
-		} */
 	}
 
 	ok := guiInfoTextListWidget.validate()
@@ -1875,20 +1748,6 @@ func main() {
 	}
 
 	// skipping this test for now
-
-	/* quick test
-	err = saveProgramSettings(programContext.programSettings)
-	if err != nil {
-		panic(err)
-	}
-	loadedProgramSettings, err := loadProgramSettings()
-	if err != nil {
-		panic(err)
-	}
-
-	if *loadedProgramSettings != *programContext.programSettings {
-		panic("failed assert: program settings change after save and load")
-	} */
 
 	// do the actual stuff we want to
 
@@ -2054,10 +1913,6 @@ func registerInputFromSDLEvent(p *ProgramContext, inputState *inputStateType, e 
 
 		var ev = e.(*sdl.MouseButtonEvent)
 
-		/* var newPressedState = false
-		if ev.State == sdl.PRESSED {
-			newPressedState = true
-		} */
 		var buttonChanged int = -1
 		switch ev.Button {
 		case sdl.BUTTON_LEFT:
@@ -2172,7 +2027,7 @@ func convertPlotScreenCoordToPlotPlane(c [2]uint32, p *ProgramContext) complex12
 }
 
 func calculatePlotValueFromPlaneCoord(c complex128, p *ProgramContext) int16 {
-	// HACK: eventually we should replace this with a function that works for multiple fractals and continuous complex
+	// TODO: eventually we should replace this with a function that works for multiple fractals and continuous complex
 	// functions
 	// same as prototype 2
 	var z complex128 = complex(0, 0)
@@ -2268,27 +2123,6 @@ func getColorFromPlotValue(v int16, p *ProgramContext) *sdl.Color {
 		panic("control point coloring method not implemented yet")
 	}
 	panic("failed assert in getColorFromPlotValue(): chooseColorMethod didn't panic when it should have")
-
-	/*
-		var paletteLen = len(p.programSettings.ColorPalette)
-		if paletteLen > math.MaxInt16 {
-			panic("failed assert: too many colors in palette!!!")
-		}
-		if paletteLen == 0 {
-			panic("failed assert: empty palette given!")
-		}
-		// using the same technique I used in prototype2
-
-		_, ok := p.colorMemo */
-
-	/*
-		var paletteStep = p.programSettings.MaxMandelbrotIterations / int16(paletteLen)
-		var paletteStepRemainder = p.programSettings.MaxMandelbrotIterations % int16(paletteLen)
-		if paletteStepRemainder != 0 {
-			panic("failed assert: max iterations not cleanly divisible by length of palette!")
-		}
-		var indexIntoPalette = int(v / paletteStep)
-		return p.programSettings.ColorPalette[indexIntoPalette] */
 }
 
 func chooseColorMethod(p *ProgramContext) ColorMethod {
@@ -2499,23 +2333,6 @@ func getFreshTextWidget(parent *Widget) *Widget {
 	}
 	return freshTextWidget
 }
-
-/*
-func createInfoTextWidgetFromIS(iS InfoString) *Widget {
-	var itWidgetFromIS = &Widget{
-		// leaving dimensions undefined
-
-		kind: guiInfoTextWidgetKind,
-		parent: w,
-
-		data: &GUIInfoTextWidgetData{
-			correspondingInfoString: iS.infoStringKind,
-		},
-
-
-
-	}
-} */
 
 func rangeInts(min int32, oneovermax int32) []int {
 	var out = []int{}
